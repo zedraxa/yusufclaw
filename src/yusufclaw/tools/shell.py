@@ -9,28 +9,90 @@ Implements YC-01 defense-in-depth:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
+import shlex
+from pathlib import Path
 from typing import Any
 
+from yusufclaw.sandbox.models import SandboxConfig
+from yusufclaw.sandbox.runner import get_sandbox_runner
 from yusufclaw.security.models import ToolManifest, ToolResources
 from yusufclaw.tools.files import DEFAULT_WORKSPACE_DIR
 from yusufclaw.tools.manifest import GuardedTool
 
 DEFAULT_ALLOWED_COMMANDS = [
-    "ls", "dir", "cat", "head", "tail", "grep", "egrep", "fgrep",
-    "find", "echo", "printf", "pwd", "which", "whereis", "wc",
-    "diff", "sort", "uniq", "date", "whoami", "uname", "env",
-    "git", "node", "pnpm", "npm", "npx", "yarn", "python", "python3",
-    "mkdir", "cp", "mv", "rm", "touch", "rmdir", "sed", "awk", "tr", "cut",
-    "tar", "gzip", "gunzip", "zip", "unzip", "curl", "wget", "jq", "sleep",
+    "ls",
+    "dir",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "find",
+    "echo",
+    "printf",
+    "pwd",
+    "which",
+    "whereis",
+    "wc",
+    "diff",
+    "sort",
+    "uniq",
+    "date",
+    "whoami",
+    "uname",
+    "env",
+    "git",
+    "node",
+    "pnpm",
+    "npm",
+    "npx",
+    "yarn",
+    "python",
+    "python3",
+    "mkdir",
+    "cp",
+    "mv",
+    "rm",
+    "touch",
+    "rmdir",
+    "sed",
+    "awk",
+    "tr",
+    "cut",
+    "tar",
+    "gzip",
+    "gunzip",
+    "zip",
+    "unzip",
+    "curl",
+    "wget",
+    "jq",
+    "sleep",
 ]
 
 SAFE_READ_ONLY_BINARIES = {
-    "pwd", "whoami", "uname", "date", "which", "whereis", "wc",
-    "ls", "dir", "cat", "head", "tail", "grep", "egrep", "fgrep",
-    "diff", "sort", "uniq", "jq",
+    "pwd",
+    "whoami",
+    "uname",
+    "date",
+    "which",
+    "whereis",
+    "wc",
+    "ls",
+    "dir",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "diff",
+    "sort",
+    "uniq",
+    "jq",
 }
 
 _RESTRICTED_ENV_RE = re.compile(r"(^|[\s/\"'=\\])\.env([a-zA-Z0-9_.-]*)")
@@ -113,7 +175,10 @@ def is_dangerous_command(command: str) -> bool:
     if re.search(r"\bgit\b", trimmed):
         is_read_only = bool(
             re.search(r"\bgit\s+(status|log|diff|show|rev-parse|describe)(\s|$)", trimmed)
-            or (re.search(r"\bgit\s+branch(\s|$)", trimmed) and not re.search(r"-(d|D|m|M)", trimmed))
+            or (
+                re.search(r"\bgit\s+branch(\s|$)", trimmed)
+                and not re.search(r"-(d|D|m|M)", trimmed)
+            )
         )
         if not is_read_only:
             return True
@@ -171,7 +236,9 @@ def create_shell_tool(
             raise ValueError("Command must be a non-empty string")
 
         if contains_restricted_path(raw_cmd):
-            raise PermissionError(f"Command references restricted sensitive file or path traversal: {raw_cmd}")
+            raise PermissionError(
+                f"Command references restricted sensitive file or path traversal: {raw_cmd}"
+            )
 
         binaries = extract_command_binaries(raw_cmd)
         for b in binaries:
@@ -187,48 +254,24 @@ def create_shell_tool(
         req_timeout = int(input_args.get("timeoutMs", default_timeout_ms))
         effective_timeout = min(max(100, req_timeout), max_timeout_ms) / 1000.0
 
-        clean_env = {
-            "PATH": os.environ.get("PATH", "/bin:/usr/bin:/usr/local/bin"),
-            "HOME": os.environ.get("HOME", "/tmp"),
-            "USER": os.environ.get("USER", "user"),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "TERM": "dumb",
-        }
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/sh",
-                "-c",
-                raw_cmd,
-                cwd=target_cwd,
-                env=clean_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=effective_timeout,
-            )
-
-            out_text = stdout_b.decode("utf-8", errors="replace")
-            err_text = stderr_b.decode("utf-8", errors="replace")
-
-            output = out_text
-            if err_text:
-                output += ("\n[stderr]\n" if output else "") + err_text
-            if proc.returncode != 0:
-                output += ("\n" if output else "") + f"[exit code: {proc.returncode}]"
-
-            if not output.strip():
-                output = "[Command completed with no output]"
-
-            if len(output) > max_output_chars:
-                output = output[:max_output_chars] + f"\n[Output truncated: exceeded {max_output_chars} characters limit]"
-
-            return output
-        except TimeoutError as e:
-            raise TimeoutError(f"Command timed out after {int(effective_timeout * 1000)}ms") from e
+        if not Path(target_cwd).resolve().is_relative_to(Path(root).resolve()):
+            raise PermissionError("Working directory escapes workspace through symlink")
+        result = await get_sandbox_runner().run_async(
+            f"cd {shlex.quote(target_cwd)} && {raw_cmd}",
+            SandboxConfig(
+                workspace_dir=root,
+                timeout_seconds=effective_timeout,
+                max_output_bytes=max_output_chars,
+            ),
+        )
+        if result.timed_out:
+            raise TimeoutError(f"Command timed out after {int(effective_timeout * 1000)}ms")
+        output = result.stdout
+        if result.stderr:
+            output += ("\n[stderr]\n" if output else "") + result.stderr
+        if result.exit_code:
+            output += f"\n[exit code: {result.exit_code}]"
+        return output[:max_output_chars] or "[Command completed with no output]"
 
     return GuardedTool(
         name="shell",
@@ -237,7 +280,10 @@ def create_shell_tool(
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute."},
-                "cwd": {"type": "string", "description": "Optional directory relative to workspace root."},
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional directory relative to workspace root.",
+                },
                 "timeoutMs": {"type": "number", "default": 30000},
             },
             "required": ["command"],

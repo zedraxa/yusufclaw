@@ -134,7 +134,7 @@ def test_shell_command_parsing_and_danger_checks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shell_execution_guards() -> None:
+async def test_shell_execution_guards(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify shell tool blocks restricted paths and non-allowlisted commands."""
     with tempfile.TemporaryDirectory() as tmpdir:
         ws = os.path.join(tmpdir, "workspace")
@@ -142,7 +142,16 @@ async def test_shell_execution_guards() -> None:
 
         tool = create_shell_tool(workspace_dir=ws)
 
-        # Safe execution
+        from unittest.mock import AsyncMock
+
+        from yusufclaw.sandbox.models import SandboxResult
+
+        runner = AsyncMock()
+        runner.run_async.return_value = SandboxResult(
+            exit_code=0, stdout="safe output", stderr="", duration_seconds=0, backend="mock",
+        )
+        monkeypatch.setattr("yusufclaw.tools.shell.get_sandbox_runner", lambda: runner)
+        # Safe execution through the sandbox contract
         out = await tool.execute({"command": "echo 'safe output'"})
         assert "safe output" in out
 

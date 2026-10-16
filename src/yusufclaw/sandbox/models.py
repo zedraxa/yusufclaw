@@ -20,16 +20,19 @@ class SandboxConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     memory_limit_mb: int = Field(
-        default=512, description="Maximum resident memory in megabytes"
+        default=512, gt=0, description="Maximum resident memory in megabytes"
     )
     cpu_limit: float = Field(
-        default=1.0, description="CPU core quota (e.g. 1.0 = 1 full core)"
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="CPU core quota (e.g. 1.0 = 1 full core)",
     )
     timeout_seconds: float = Field(
-        default=30.0, description="Execution timeout limit in seconds"
+        default=30.0, gt=0, allow_inf_nan=False, description="Execution timeout limit in seconds"
     )
     max_output_bytes: int = Field(
-        default=65536, description="Maximum captured stdout/stderr size in bytes (64 KB)"
+        default=65536, gt=0, description="Maximum captured stdout/stderr size in bytes (64 KB)"
     )
     allow_network: bool = Field(
         default=False, description="Whether network access is permitted (disabled by default)"
@@ -40,6 +43,7 @@ class SandboxConfig(BaseModel):
     read_only_binds: list[str] = Field(
         default_factory=list, description="Host paths to mount strictly read-only"
     )
+    action_log_path: str = ".data/agent-data/sandbox-actions.jsonl"
     env: dict[str, str] = Field(
         default_factory=dict, description="Clean environment variables for the sandbox"
     )

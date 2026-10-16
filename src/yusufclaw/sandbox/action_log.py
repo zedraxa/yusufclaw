@@ -7,13 +7,14 @@ to a persistent JSONL log and provides deterministic undo capabilities.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from yusufclaw.sandbox.models import ActionLogEntry, UndoResult
+from yusufclaw.sandbox.models import ActionLogEntry, ActionStatus, UndoResult
 
 
 class ReversibleActionLog:
@@ -35,6 +36,7 @@ class ReversibleActionLog:
         details: dict[str, Any] | None = None,
         undo_hint: dict[str, Any] | None = None,
         reversible: bool = True,
+        status: ActionStatus = "executed",
     ) -> ActionLogEntry:
         """Append a new action entry to the action log."""
         self._ensure_log_file()
@@ -50,12 +52,14 @@ class ReversibleActionLog:
             details=details or {},
             undo_hint=undo_hint,
             reversible=reversible,
-            status="executed",
+            status=status,
         )
 
         line = json.dumps(entry.model_dump(), separators=(",", ":"), ensure_ascii=False)
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
         return entry
 
