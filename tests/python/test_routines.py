@@ -29,6 +29,13 @@ from yusufclaw.routines import (
     parse_cron,
 )
 
+
+@pytest.fixture(autouse=True)
+def legacy_routine_contract(monkeypatch, durable_queue_defaults):
+    # These compatibility tests deliberately exercise the feature flag's old path.
+    monkeypatch.setenv('YUSUFCLAW_QUEUE_ENABLED', '0')
+
+
 SAMPLE_ROUTINE = Routine(
     id="morning",
     cron="0 9 * * 1-5",
