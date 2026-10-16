@@ -179,3 +179,58 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check`: 0 uyarı/hata.
   - `uv run mypy src tests/python`: 33 kaynak dosyasında strict tip denetimi 0 hata ile geçti.
   - `packages/` (TypeScript), `src/yusufclaw/security/`, `src/yusufclaw/tools/` ve AWS yapılandırmalarına dokunulmadı.
+
+---
+
+## 7. Python Gateway Alt Sistemi Taşıması (`py-gateway` Dalı)
+
+### 7.1 Tamamlanan Mimari ve Modüller
+1. **Asenkron Olay Yolu (`src/yusufclaw/gateway/bus.py`)**:
+   - `IncomingMessage`: Strongly-typed model, camelCase (`userId`, `conversationId`, `requestId`) ve snake_case uyumu.
+   - `MessageBus`: Kanal bazlı allowlist denetimi (`cli`, `telegram`, `web`). Yetkisiz erişimlerde `UnauthorizedUserError` fırlatır.
+   - İzole oturum anahtarı: `json.dumps([channel, userId, conversationId], separators=(",", ":"))`.
+   - Çağrıyı `Agent.handle`'a onay geri çağrısı (`approve`) ile iletir.
+2. **Onay Sağlayıcı Protokolü ve Eylem Kartı Biçimlendirmesi (`src/yusufclaw/gateway/approval.py`)**:
+   - `ApprovalProvider` protokolü: `register`, `consume`, `deny`, `get` metotları ile YC-05 onay yaşam döngüsü.
+   - `ActionCard` ve `ActionCardRendered` modelleri: Değiştirilemez başlık, kesin komut, etkiler, taint durumu ve geri alınabilirlik.
+   - `format_telegram_card_message`: Eylem kartını Türkçeleştirilmiş formatta (`⚠️ [ONAY GEREKİYOR...]`) oluşturur; ajanın güvenilmeyen iddialarını (`[Ajanın İddiası (Güvenilmeyen Açıklama)]`) açıkça ayırır.
+   - `build_telegram_card_keyboard`: Doğrulanabilir callback query verileri (`approve:<id>:<nonce>`, `deny:...`, `details:...`) içeren inline klavye üretir.
+3. **Telegram Bot Ağ Geçidi (`src/yusufclaw/gateway/telegram.py`)**:
+   - `TelegramApi`: `https://api.telegram.org` REST istemcisi. Ağ hatalarında token gizler (`RuntimeError("Telegram network request failed")`). 429 durumlarında `retry_after` sürelerine uyar.
+   - `split_telegram_text`: Mesajları 4000 karakteri aşmayacak şekilde, UTF-16 surrogate veya çok baytlı emoji kod noktalarını parçalamadan böler.
+   - `TelegramAdapter`:
+     - Grup sohbetlerini, bot mesajlarını, metinsiz güncellemeleri ve yetkisiz kullanıcıları filtreler.
+     - Bellek durumunda (`telegram-offset:<sha256(token)>`) güncelleme ofsetini kalıcı tutar ve yeniden başlatmada kaldığı yerden devam eder.
+     - Terminal çakışmalarda (401, 403, 409) derhal durur; geçici hatalarda yeniden dener.
+     - İç sağlayıcı hatalarını ve gizli anahtarları kullanıcı çıktısından arındırır.
+     - `ApprovalProvider` üzerinden interaktif eylem kartı onaylarını yönetir (replay ve argüman tahrifatı koruması).
+     - Webhook modu için `handle_webhook()` desteği sunar.
+4. **FastAPI Web Ağ Geçidi ve AG-UI SSE Akışı (`src/yusufclaw/gateway/web.py`, `web_page.py`)**:
+   - Minimal web UI: `GET /` (HTML), `GET /app.js` (JavaScript), `GET /style.css` (CSS). Token içermeyen güvenli HTML, sıkı CSP (`frame-ancestors 'none'`) ve güvenli DOM (`textContent`, sıfır `innerHTML`/`localStorage`).
+   - Sabit zamanlı Bearer token denetimi (`WEB_AUTH_TOKEN`, SHA-256 digest).
+   - Origin doğrulaması: Cross-origin istekler engellenir (403).
+   - İçerik boyutu (<=100,000 bayt, 413) ve strict `application/json` tipi (415) denetimi.
+   - `POST /api/chat`: Standart turn çalıştırma; sağlayıcı hatalarını 502'ye maskeleme.
+   - `POST /api/chat/stream` & `GET /api/events`: AG-UI 1.0 uyumlu Server-Sent Events (SSE) akışı (`progress`, `message`, `done`).
+   - `GET /api/routines` & `WebAdapter.deliver`: Zamanlanmış görev çıktılarını kullanıcı gelen kutusunda tekilleştirerek sunma.
+   - `WebAdapter`: Ephemeral port desteği (`port: 0`), Uvicorn asenkron sunucu yönetimi ve temiz kapatma.
+5. **CLI Ağ Geçidi (`src/yusufclaw/gateway/cli.py`)**:
+   - `run_cli`: `--message` / `-m` ile one-shot çalıştırma; argümansız TTY dışı çalıştırmada hata fırlatma; interaktif terminal döngüsü (`You> `, `/help`, `/exit`, eylem kartı onayı).
+   - Typer uygulaması (`cli_app`): `turn`, `chat`, `version` ve doğrudan `--message` çağrıları.
+6. **Yapılandırma ve Ana Giriş Noktası (`src/yusufclaw/gateway/config.py`, `main.py`)**:
+   - Pydantic tabanlı `GatewayConfig` ve `load_config(env)`: Bedrock, OpenAI, Ollama ve Telegram yapılandırma kurallarını sıkı doğrular.
+   - `main.py`: `cli`, `web`, `telegram` modlarını dinamik başlatır; SIGINT/SIGTERM sinyalleri ile zarif kapatma uygular.
+
+### 7.2 Test ve Doğrulama
+- **Port Edilen Testler**:
+  - `tests/python/test_bus.py`: Olay yolu yetkilendirme ve oturum formatlama.
+  - `tests/python/test_gateway_config.py`: Yapılandırma doğrulama kuralları.
+  - `tests/python/test_telegram_gateway.py`: Telegram filtreleme, ofset kalıcılığı, 409 yönetimi, emoji bölme, hata arındırma, YC-05 ActionCard formatı ve inline onay callback query korumaları.
+  - `tests/python/test_web_gateway.py`: Bearer auth, cross-origin engelleme, CSP, token-free HTML/JS, 502 hata maskeleme, inbox teslimatı, ephemeral port yaşam döngüsü, AG-UI SSE akışı.
+  - `tests/python/test_cli_gateway.py`: One-shot mod, TTY denetimi, interaktif terminal döngüsü ve onay komutları.
+- **Sonuçlar**:
+  - `uv run pytest`: **60 testin tamamı** offline, sahte sağlayıcılarla ve sıfır dış ağ bağlantısıyla yeşil geçti (5.36s).
+  - `uv run ruff check .`: 0 hata, 0 uyarı.
+  - `uv run mypy src tests/python`: 43 kaynak dosyasında strict tip denetimi 0 hata ile geçti.
+  - `packages/` (TypeScript), `src/yusufclaw/security/`, `src/yusufclaw/tools/`, `src/yusufclaw/memory/` ve AWS yapılandırmalarına dokunulmadı.
+
