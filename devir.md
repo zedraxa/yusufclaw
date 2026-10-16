@@ -921,3 +921,37 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - `shell` aracı sandbox runner'ı tercih eder; host shell'e düşmez. İptal/timeout süreç grubunu öldürür; konteyner cleanup denemesi audite yazılır.
 - `ReversibleActionLog`: intent+outcome (komut hash, backend, exit); ham komut/env/çıktı saklanmaz. Keyfi komutlar geri alınamaz olarak belgelenir.
 - Doğrulama: `uv run pytest -q` → **273 passed**; ruff temiz; mypy src (85 dosya) temiz. Mock/skip ile bwrap/podman gerekmez. Kullanım: `docs/PY-SANDBOX.md`. Agent/models/gateway/roles/queue/memory/evals değiştirilmedi. AWS yok; push yapılmadı. §22 evals için ayrılmıştır.
+
+## 24. AWS Dağıtımı (infra_py) — `py-deploy` Dalı
+
+**Durum (2026-10-16):** Kod dağıtıma hazır, testler geçiyor; **`cdk bootstrap` henüz yapılmadı** çünkü root (`default`) profil oturumu süresi dolmuş (`aws login` gerekiyor) ve `yusufclaw-agent` kullanıcısının IAM rol oluşturma yetkisi yok. Bu yüzden `cdk deploy` çalıştırılmadı; aşağıdaki çıktılar dağıtımdan sonra doldurulacak.
+
+### Mimari (tek stack: `YusufClawInfraStack`, us-east-1, etiket `Project=yusufclaw`)
+- DynamoDB on-demand bellek tablosu, S3 dosya bucket'ı (SSE-S3).
+- Telegram webhook: REST API Gateway + ARM64 Lambda (`yusufclaw-telegram-webhook`).
+- **Web UI + AG-UI backend:** `yusufclaw-web` Lambda konteyneri (Lambda Web Adapter, `RESPONSE_STREAM`) + Function URL (HTTPS). ALB/NAT/CloudFront yok, sıfıra ölçeklenir.
+  - Kimlik doğrulama: her API çağrısında `Authorization: Bearer <token>`. Token dağıtımda üretilir ve **yalnızca** Secrets Manager'da `yusufclaw/web/auth-token` adıyla saklanır. Giriş: URL'yi aç, "Access token" alanına secret değerini yapıştır (`aws secretsmanager get-secret-value --secret-id yusufclaw/web/auth-token --profile yusufclaw --query SecretString --output text`).
+  - Model: `us.anthropic.claude-haiku-4-5-20251001-v1:0` (Bedrock, rol kimlik bilgileri; `BedrockProvider` profil yoksa varsayılan kimliğe düşer).
+  - Kısıt: bellek `/tmp/memory.sqlite` (soğuk başlatmada sıfırlanır); onay kartı (YC-05) bellek içi olduğundan, Lambda'da onay isteği farklı bir örneğe düşebilir → onay gerektiren araçlar güvenilir çalışmayabilir (çözüm: onayları DynamoDB'ye taşımak).
+- ECS Fargate cluster + task definition (heavy jobs), 0 NAT, public subnet; yalnızca RunTask ile çalışır (boşta $0).
+- AWS Budget (50 USD) → SNS topic `BudgetAlertTopicArn` (e-posta aboneliği yok; istenirse sonradan abone olunabilir).
+
+### Tahmini aylık maliyet
+- Boşta: ~1 USD (Secrets Manager 0.40, ECR imajı ~0.10, S3/DynamoDB/Logs kuruşlar; VPC/NAT/ALB/sabit compute yok).
+- Kullanım: Haiku 4.5 ~1 USD/M girdi, 5 USD/M çıktı token → günde ~100 mesajla ~10–20 USD. Fargate işi ~0.05 USD/saat. 50 USD bütçe içinde.
+
+### Dağıtımı tamamlamak için (tek seferlik, root)
+```bash
+aws login   # root/default oturumu
+cd ~/projects/wt/yc-deploy/infra_py
+cdk bootstrap aws://478170046831/us-east-1 --profile default --tags Project=yusufclaw
+aws iam put-user-policy --profile default --user-name yusufclaw-agent --policy-name cdk-assume \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::478170046831:role/cdk-hnb659fds-*"}]}'
+cdk deploy --all --require-approval never --profile yusufclaw
+```
+
+### Kaldırma (teardown)
+```bash
+cd infra_py && cdk destroy --all --force --profile yusufclaw
+# DynamoDB tablosu ve S3 bucket RETAIN politikasındadır; gerekirse elle silin.
+```
