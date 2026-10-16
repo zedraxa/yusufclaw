@@ -401,3 +401,69 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - **Dokunulmayan Alanlar**: `src/yusufclaw/gateway`, `security`, `tools`, `memory`, `skills`, `routines`, `packages/` ve AWS altyapısı %100 temiz ve dokunulmamıştır.
 - **Kılavuz Belgesi**: `PY-OTEL.md`.
 
+## 11. Python AWS CDK Altyapı Taşıması (`py-infra` Dalı)
+
+### 11.1 Genel Mimari ve Kararlar
+- TypeScript referansındaki `packages/infra` AWS CDK altyapısı, Python 3.12 ve AWS CDK v2 mimarisine uygun olarak bağımsız bir paket halinde `infra_py/` altına taşınmıştır.
+- **VALIDATE ONLY Kuralı**: Canlıya kesinlikle deploy yapılmamış (`cdk deploy` veya `aws cloudformation deploy` çağrılmamıştır). Tüm doğrulama `cdk synth`, unit testler (`aws-cdk assertions` / `pytest`), `ruff` ve `mypy` üzerinden gerçekleştirilmiştir.
+- **Maliyet ve Bütçe Koruması**:
+  - AWS Profile: `yusufclaw`
+  - AWS Region: `us-east-1`
+  - Aylık Bütçe Sınırı: **$50 USD**
+  - **0 NAT Gateway Mimarisi**: Klasik NAT Gateway'lerin aylık maliyeti (~$32.40/adet) tüm bütçeyi boşta harcayacağı için, ECS Fargate ağır işler VPC'si 0 NAT Gateway ve genel alt ağlar (`assignPublicIp: true`) ile kurgulanmıştır.
+  - **$0 Boşta Maliyet**: DynamoDB `PAY_PER_REQUEST` on-demand modu ile kullanılmadığı anlarda sıfır maliyet hedeflenmiştir.
+- **Dokunulmayan Alanlar**: `src/yusufclaw/gateway`, `security`, `tools`, `memory`, `skills`, `routines`, `agent.py`, `packages/core|gateway|models|tools` (TS) %100 temiz ve dokunulmamış olarak korunmuştur.
+
+### 11.2 Gerçekleştirilen Mimari Bileşenler
+1. **Paket ve Yapılandırma (`infra_py/pyproject.toml`, `infra_py/cdk.json`, `infra_py/infra_py/config.py`)**:
+   - Python `>=3.12`, `aws-cdk-lib>=2.100.0`, `constructs>=10.0.0,<11.0.0` bağımlılıkları.
+   - Pydantic/Dataclass tabanlı strongly-typed `YusufClawConfig` ve `DEFAULT_CONFIG`.
+   - `cdk.json` içinde profile `yusufclaw`, v2 özellik bayrakları ve `python3 app.py` başlatıcısı.
+2. **DynamoDB Tek-Tablo Bellek Yapısı (`infra_py/infra_py/constructs/database.py`)**:
+   - `yusufclaw-memory` tablosu; PK `pk`, SK `sk`.
+   - `PAY_PER_REQUEST` faturalandırma modu.
+   - `ttl` niteliğinde TTL etkinleştirme.
+   - GSI1 (`gsi1pk`, `gsi1sk`, projection `ALL`) tersine arama ve filtreleme dizini.
+   - Point-in-Time Recovery (`PointInTimeRecoverySpecification`) etkinleştirilmiş.
+   - `grant_read_data`, `grant_write_data`, `grant_read_write_data` izin metotları.
+3. **S3 Dosya ve Yapay Bellek Deposu (`infra_py/infra_py/constructs/storage.py`)**:
+   - `yusufclaw-files-${AWS::AccountId}-${AWS::Region}` kovası.
+   - S3-managed SSE şifreleme (`AES256`), `BLOCK_ALL` genel erişim engeli, versiyonlama.
+   - Zorunlu SSL (`aws:SecureTransport: false` deny bucket policy).
+   - Yaşam döngüsü kuralları: `temp/` dizini 14 gün sonra, eski versiyonlar 30 gün sonra otomatik silinir; yarım kalan multipart yüklemeleri 7 gün sonra iptal edilir.
+   - Araç entegrasyonu için CORS yapılandırması.
+4. **Amazon Bedrock IAM Yetkileri (`infra_py/infra_py/constructs/bedrock_iam.py`)**:
+   - `BedrockInvokeManagedPolicy` managed policy: `InvokeModel`, `InvokeModelWithResponseStream`, `GetFoundationModel`, `ListFoundationModels`, `GetInferenceProfile`, `ListInferenceProfiles`, `ApplyGuardrail`.
+   - Temel modeller (`arn:aws:bedrock:*::foundation-model/*`) ve çapraz bölge çıkarım profillerini kapsar.
+5. **ECS Fargate Ağır Görevler Alt Sistemi (`infra_py/infra_py/constructs/heavy_jobs.py`)**:
+   - 0 NAT Gateway maliyet korumalı VPC (`max_azs=2`, `nat_gateways=0`, `Public` subnets).
+   - ECS Cluster (`yusufclaw-heavy-jobs-cluster`, Container Insights v2 devre dışı bırakılarak CloudWatch metrik ücretlerinden tasarruf edilmiştir).
+   - CloudWatch Log Group (`/ecs/yusufclaw-heavy-jobs`, 30 gün saklama).
+   - Ayrı `execution_role` ve `task_role` (DynamoDB, S3, Bedrock yetkileri verilmiş).
+   - 1 vCPU (1024), 2048 MB RAM Fargate Task Definition ve `yusufclaw-heavy-runner` konteyneri.
+   - `grant_run_task` ile Lambda'ya `ecs:RunTask` ve `iam:PassRole` yetkisi.
+6. **API Gateway & Telegram Webhook Lambda (`infra_py/infra_py/constructs/telegram_webhook.py`, `infra_py/lambda/telegram_webhook/index.py`)**:
+   - Regional REST API (`yusufclaw-telegram-api`), 50 req/s rate limit ve 100 burst kapasitesi.
+   - `/webhook/telegram` POST ve GET metotları.
+   - Python 3.12 ARM64 Graviton Lambda (`yusufclaw-telegram-webhook`), 512MB RAM, 60s zaman aşımı.
+   - Python Lambda işleyicisi: GET sağlık kontrolü (200 OK), POST güncelleme ayrıştırma, `x-telegram-bot-api-secret-token` doğrulama, hızlı 200 OK yanıtı, bozuk verilerde sonsuz tekrar döngüsünü önleme (200 `{"ok": false}`).
+7. **AWS Budgets $50/Ay Bütçe Koruması (`infra_py/infra_py/constructs/cost_budget.py`)**:
+   - Aylık $50 USD bütçe sınırı (`yusufclaw-monthly-50-usd-budget`).
+   - Çok katmanlı bildirimler: %50 gerçekleşen ($25), %80 gerçekleşen ($40), %100 gerçekleşen ($50), %100 tahmin edilen ($50 erken uyarı).
+   - `yusufclaw-budget-alerts` SNS Topic ve yetki politikası; e-posta abonesi (`alerts@yusufclaw.local`).
+8. **Stack Orkestrasyonu ve Çıkışlar (`infra_py/infra_py/stack.py`, `infra_py/app.py`)**:
+   - 10 adet CloudFormation Output ve Export (`yusufclaw-telegram-webhook-url`, `yusufclaw-dynamodb-table-name`, `yusufclaw-files-bucket-name`, `yusufclaw-ecs-cluster-name`, `yusufclaw-fargate-task-def-arn`, `yusufclaw-budget-alert-topic-arn` vb.).
+   - Kaynak etiketleri: `Project=YusufClaw`, `ManagedBy=AWS-CDK`, `Owner=yusuf`, `Budget=50USD`.
+
+### 11.3 Test ve Doğrulama
+- **CloudFormation Sentez Eşdeğerliği (`cdk synth`)**:
+  - TypeScript CDK referansı ile Python CDK çıktısı karşılaştırılmış:
+  - **Toplam Kaynak:** Her iki yığında da birebir **49 CloudFormation Kaynağı** (DynamoDB, S3, IAM, VPC, Subnets, ECS, Lambda, API GW, SNS, Budgets).
+  - **Çıkışlar:** 10 adet CloudFormation çıkışı ve export isimleri %100 örtüşmektedir.
+- **Birim Testleri (`infra_py/tests/test_infra_stack.py`)**:
+  - `aws_cdk.assertions` (`Template`, `Match`) ve Python Lambda birim testleri.
+  - **14 testin tamamı** offline başarıyla geçti (`uv run pytest`, 11.91s).
+- **Kod Kalitesi ve Tip Denetimi**:
+  - `uv run ruff check .` -> `All checks passed!` (0 hata, 0 uyarı).
+  - `uv run mypy infra_py tests lambda` -> `Success: no issues found in 13 source files` (Strict mod, 0 hata).
+- **Kılavuz Belgesi**: `PY-INFRA.md`.
