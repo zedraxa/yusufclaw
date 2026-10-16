@@ -51,3 +51,12 @@ ATTR_TOOL_IS_GUARDED: Final[str] = "yusufclaw.tool.is_guarded"
 ATTR_APPROVAL_ID: Final[str] = "yusufclaw.approval.id"
 ATTR_APPROVAL_TOOL_NAME: Final[str] = "yusufclaw.approval.tool_name"
 ATTR_APPROVAL_STATUS: Final[str] = "yusufclaw.approval.status"
+
+# ---------------------------------------------------------------------------
+# Model Routing Attributes
+# ---------------------------------------------------------------------------
+ATTR_ROUTING_ROLE: Final[str] = "yusufclaw.routing.role"
+ATTR_ROUTING_PROVIDER: Final[str] = "yusufclaw.routing.provider"
+ATTR_ROUTING_TARGET: Final[str] = "yusufclaw.routing.target"
+ATTR_ROUTING_REASON: Final[str] = "yusufclaw.routing.reason"
+

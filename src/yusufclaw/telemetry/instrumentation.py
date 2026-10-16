@@ -31,6 +31,10 @@ from yusufclaw.telemetry.attributes import (
     ATTR_GEN_AI_USAGE_PROMPT_TOKENS,
     ATTR_GEN_AI_USAGE_TOTAL_TOKENS,
     ATTR_REQUEST_ID,
+    ATTR_ROUTING_PROVIDER,
+    ATTR_ROUTING_REASON,
+    ATTR_ROUTING_ROLE,
+    ATTR_ROUTING_TARGET,
     ATTR_SESSION_ID,
     ATTR_TOOL_CALL_ID,
     ATTR_TOOL_IS_GUARDED,
@@ -121,6 +125,7 @@ async def trace_model_call(
     provider: Any,
     request: Any,
     tracer: trace.Tracer | None = None,
+    role: str | None = None,
 ) -> AsyncIterator[trace.Span]:
     """Async context manager tracing a single model provider completion call."""
     tr = _get_active_tracer(tracer)
@@ -132,6 +137,8 @@ async def trace_model_call(
             span.set_attribute(ATTR_GEN_AI_SYSTEM, system_name)
             span.set_attribute(ATTR_GEN_AI_REQUEST_MODEL, model_name)
             span.set_attribute(ATTR_GEN_AI_OPERATION_NAME, "chat")
+            if role:
+                span.set_attribute(ATTR_ROUTING_ROLE, role)
 
             max_tokens = getattr(request, "max_tokens", None)
             if max_tokens is not None:
@@ -330,3 +337,26 @@ async def trace_approval_wait(
             }
             metrics.approval_duration.record(duration_ms, attrs)
             metrics.approval_counter.add(1, attrs)
+
+
+# ---------------------------------------------------------------------------
+# 5. Model Routing Telemetry
+# ---------------------------------------------------------------------------
+def record_routing_decision(
+    span: trace.Span | None = None,
+    *,
+    role: str,
+    provider_name: str,
+    target: str | None = None,
+    reason: str | None = None,
+) -> None:
+    """Record model routing decision attributes on the given or current span."""
+    active_span = span or trace.get_current_span()
+    if active_span is not None and active_span.is_recording():
+        active_span.set_attribute(ATTR_ROUTING_ROLE, role)
+        active_span.set_attribute(ATTR_ROUTING_PROVIDER, provider_name)
+        if target:
+            active_span.set_attribute(ATTR_ROUTING_TARGET, target)
+        if reason:
+            active_span.set_attribute(ATTR_ROUTING_REASON, reason)
+
