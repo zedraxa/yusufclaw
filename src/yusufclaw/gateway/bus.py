@@ -31,6 +31,7 @@ class IncomingMessage(BaseModel):
     conversation_id: str = Field(alias="conversationId")
     request_id: str = Field(alias="requestId")
     text: str
+    agent_id: str | None = Field(default=None, alias="agentId")
 
     @property
     def userId(self) -> str:
@@ -43,6 +44,10 @@ class IncomingMessage(BaseModel):
     @property
     def requestId(self) -> str:
         return self.request_id
+
+    @property
+    def agentId(self) -> str | None:
+        return self.agent_id
 
 
 class MessageBus:
@@ -77,6 +82,7 @@ class MessageBus:
         message: IncomingMessage | dict[str, Any],
         approve: Any = None,
         signal: Any = None,
+        ask_question: Any = None,
     ) -> str:
         """Authorize message, compute isolated session ID, and invoke Agent.handle."""
         if isinstance(message, dict):
@@ -88,13 +94,29 @@ class MessageBus:
         if allowed_users is None or msg.user_id not in allowed_users:
             raise UnauthorizedUserError("User is not authorized")
 
-        session = json.dumps([msg.channel, msg.user_id, msg.conversation_id], separators=(",", ":"))
-        result = await self.agent.handle(
-            session=session,
-            request_id=msg.request_id,
-            text=msg.text,
-            approve=approve,
-        )
+        conv_id = msg.conversation_id
+        if msg.agent_id and not conv_id.startswith(f"{msg.agent_id}:"):
+            conv_id = f"{msg.agent_id}:{conv_id}"
+
+        session = json.dumps([msg.channel, msg.user_id, conv_id], separators=(",", ":"))
+        handle_kwargs: dict[str, Any] = {
+            "session": session,
+            "request_id": msg.request_id,
+            "text": msg.text,
+            "approve": approve,
+        }
+        if signal is not None:
+            handle_kwargs["signal"] = signal
+        if ask_question is not None:
+            handle_kwargs["ask_question"] = ask_question
+
+        try:
+            result = await self.agent.handle(**handle_kwargs)
+        except TypeError:
+            handle_kwargs.pop("ask_question", None)
+            handle_kwargs.pop("signal", None)
+            result = await self.agent.handle(**handle_kwargs)
+
         return str(result)
 
 

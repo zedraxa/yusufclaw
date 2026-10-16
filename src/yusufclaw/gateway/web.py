@@ -42,6 +42,20 @@ from yusufclaw.gateway.approval import (
     InMemoryApprovalProvider,
 )
 from yusufclaw.gateway.bus import IncomingMessage, MessageBus
+from yusufclaw.gateway.credentials import (
+    CredentialBroker,
+    get_credential_broker,
+)
+from yusufclaw.gateway.models import (
+    AgentPersona,
+    AgUiEnvelope,
+    MilestoneStep,
+    QuestionOption,
+    QuestionWidget,
+    SecretRequestWidget,
+    SecretSubmitInput,
+    WidgetResolveInput,
+)
 from yusufclaw.gateway.web_page import CHAT_PAGE, CHAT_SCRIPT, CHAT_STYLE
 from yusufclaw.telemetry import setup_telemetry
 
@@ -131,6 +145,7 @@ class ApprovalInput(BaseModel):
     decision: Literal["approve", "deny"] = Field(default="approve")
     action: Literal["approve", "deny"] | None = None
     args: dict[str, Any] | None = None
+    edited_args: dict[str, Any] | None = Field(default=None, alias="editedArgs")
 
     @property
     def approvalId(self) -> str:
@@ -139,6 +154,10 @@ class ApprovalInput(BaseModel):
     @property
     def resolved_action(self) -> Literal["approve", "deny"]:
         return self.action or self.decision
+
+    @property
+    def resolved_args(self) -> dict[str, Any] | None:
+        return self.edited_args if self.edited_args is not None else self.args
 
 
 class ChatMessageInput(BaseModel):
@@ -149,6 +168,7 @@ class ChatMessageInput(BaseModel):
     text: str = Field(min_length=1, max_length=16000)
     conversation_id: str = Field(min_length=1, max_length=128, alias="conversationId")
     request_id: str = Field(min_length=1, max_length=128, alias="requestId")
+    agent_id: str | None = Field(default=None, max_length=64, alias="agentId")
 
     @property
     def conversationId(self) -> str:
@@ -157,6 +177,10 @@ class ChatMessageInput(BaseModel):
     @property
     def requestId(self) -> str:
         return self.request_id
+
+    @property
+    def agentId(self) -> str:
+        return self.agent_id or "orchestrator"
 
 
 class RoutineTarget(BaseModel):
@@ -216,6 +240,34 @@ def format_sse_event(event: str, data: dict[str, Any] | str) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def format_agui_event(
+    event_type: str,
+    payload: dict[str, Any],
+    run_id: str,
+    session_id: str,
+    agent_id: str = "orchestrator",
+    sequence: int = 1,
+    event_id: str | None = None,
+) -> str:
+    """Format an AG-UI 1.0 Server-Sent Event frame with standard envelope."""
+    evt_id = event_id or f"evt_{uuid.uuid4().hex[:18]}"
+    ts = datetime.now(UTC).isoformat()
+    merged = dict(payload)
+    merged.update(
+        {
+            "eventId": evt_id,
+            "runId": run_id,
+            "sessionId": session_id,
+            "agentId": agent_id,
+            "timestamp": ts,
+            "sequence": sequence,
+            "eventType": event_type,
+            "payload": payload,
+        }
+    )
+    return f"event: {event_type}\ndata: {json.dumps(merged)}\n\n"
+
+
 def create_app(
     bus: MessageBus | Settings | None = None,
     memory: Any | None = None,
@@ -223,6 +275,7 @@ def create_app(
     user_id: str = "local",
     settings: Settings | None = None,
     approval_provider: ApprovalProvider | None = None,
+    credential_broker: CredentialBroker | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI web gateway application."""
     actual_bus: MessageBus | None
@@ -249,7 +302,13 @@ def create_app(
     else:
         active_approval_provider = InMemoryApprovalProvider()
 
+    active_credential_broker: CredentialBroker = (
+        credential_broker if credential_broker is not None else get_credential_broker()
+    )
     pending_approvals: dict[str, dict[str, Any]] = {}
+    pending_questions: dict[str, dict[str, Any]] = {}
+    resolved_questions: dict[str, dict[str, Any]] = {}
+    pending_secrets: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Any:
@@ -454,7 +513,9 @@ def create_app(
 
         if app_in.resolved_action == "approve":
             check_args = (
-                app_in.args if app_in.args is not None else pending.get("expected_args")
+                app_in.resolved_args
+                if app_in.resolved_args is not None
+                else pending.get("expected_args")
             )
             res = active_approval_provider.consume(
                 approval_id=app_id,
@@ -486,6 +547,11 @@ def create_app(
                 content={"status": "denied", "approvalId": app_id},
             )
 
+    @app.post("/api/actions/resolve-approval")
+    async def resolve_approval(request: Request) -> JSONResponse:
+        """AG-UI action endpoint for human action approval/denial (UX-01, UX-05)."""
+        return await _handle_approval_decision(request)
+
     @app.post("/api/chat/approval")
     async def chat_approval(request: Request) -> JSONResponse:
         """Handle human action approval/denial for chat turns."""
@@ -495,6 +561,188 @@ def create_app(
     async def approval(request: Request) -> JSONResponse:
         """Alias endpoint for human action approval/denial."""
         return await _handle_approval_decision(request)
+
+    @app.post("/api/actions/resolve-widget")
+    async def resolve_widget(request: Request) -> JSONResponse:
+        """AG-UI action endpoint for resolving inline question widgets (UX-04)."""
+        _verify_auth(request)
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid widget payload"}
+            ) from exc
+
+        try:
+            widget_in = WidgetResolveInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid widget payload"}
+            ) from exc
+
+        q_id = widget_in.question_id
+        if q_id in resolved_questions:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Replay detected: question already resolved"},
+            )
+
+        pending = pending_questions.get(q_id)
+        if pending is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Question not found or expired"},
+            )
+
+        fut = pending.get("future")
+        res_payload = {
+            "questionId": q_id,
+            "selectedOptionIds": widget_in.selected_option_ids,
+            "customText": widget_in.custom_text,
+        }
+        resolved_questions[q_id] = res_payload
+        if fut and not fut.done():
+            fut.set_result(res_payload)
+
+        return JSONResponse(
+            status_code=200,
+            content={"status": "resolved", **res_payload},
+        )
+
+    @app.post("/api/actions/secret-submit")
+    async def submit_secret(request: Request) -> JSONResponse:
+        """AG-UI action endpoint for submitting masked credentials to local broker (UX-06)."""
+        _verify_auth(request)
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid secret payload"}
+            ) from exc
+
+        try:
+            sec_in = SecretSubmitInput.model_validate(raw_data)
+            secret_val = sec_in.resolve_secret()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid secret payload"}
+            ) from exc
+
+        fp = active_credential_broker.store(
+            key_name=sec_in.key_name,
+            secret_value=secret_val,
+            service_name=sec_in.service_name or "",
+        )
+
+        req_id = sec_in.request_id
+        fut = pending_secrets.get(req_id)
+        if fut and not fut.done():
+            fut.set_result(
+                {
+                    "requestId": req_id,
+                    "keyName": sec_in.key_name,
+                    "fingerprint": fp,
+                    "secret": secret_val,
+                }
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "stored",
+                "keyName": sec_in.key_name,
+                "fingerprint": fp,
+                "systemPill": CredentialBroker.format_system_pill(sec_in.key_name, fp),
+            },
+        )
+
+    @app.get("/api/agents")
+    async def get_agents(request: Request) -> JSONResponse:
+        """List active named specialist agent personas for the sidebar (UX-02)."""
+        _verify_auth(request)
+        agents_data: list[dict[str, Any]] = []
+        try:
+            from yusufclaw.roles import get_role_catalog
+
+            catalog = get_role_catalog()
+            for r in catalog.list_roles():
+                agents_data.append(
+                    {
+                        "agentId": r.role_id,
+                        "name": r.name,
+                        "role": r.role_id,
+                        "model": f"Tier {r.model_tier.capitalize()}",
+                        "status": "online",
+                        "description": r.description,
+                        "allowedTools": r.allowed_tools,
+                    }
+                )
+        except Exception:
+            agents_data = [
+                {
+                    "agentId": "orchestrator",
+                    "name": "YusufClaw Core",
+                    "role": "orchestrator",
+                    "model": "Strong (Claude 3.7 Sonnet)",
+                    "status": "online",
+                    "description": "General coordinator & conversationalist",
+                    "allowedTools": ["web_fetch", "memory_search"],
+                },
+                {
+                    "agentId": "coder",
+                    "name": "Coder (Codex)",
+                    "role": "coder",
+                    "model": "Strong (Bedrock Sonnet)",
+                    "status": "online",
+                    "description": "Sandboxed software engineer",
+                    "allowedTools": ["file_read", "file_write", "shell"],
+                },
+                {
+                    "agentId": "researcher",
+                    "name": "Researcher",
+                    "role": "researcher",
+                    "model": "Strong",
+                    "status": "online",
+                    "description": "Read-only web explorer & literature searcher",
+                    "allowedTools": ["web_fetch", "arxiv_search"],
+                },
+                {
+                    "agentId": "ops",
+                    "name": "DevSecOps",
+                    "role": "ops",
+                    "model": "Strong",
+                    "status": "online",
+                    "description": "Cloud infra validator & security linter",
+                    "allowedTools": ["shell", "infra_validate"],
+                },
+            ]
+        return JSONResponse(status_code=200, content=agents_data)
+
+    @app.get("/api/credentials")
+    async def get_credentials(request: Request) -> JSONResponse:
+        """List safe metadata for all stored credentials (fingerprints only, never plaintext) (UX-06)."""
+        _verify_auth(request)
+        creds = [
+            s.model_dump(by_alias=True)
+            for s in active_credential_broker.list_secrets()
+        ]
+        return JSONResponse(status_code=200, content=creds)
 
     @app.post("/api/chat")
     async def chat(
@@ -518,6 +766,9 @@ def create_app(
                     msg_in=msg_in,
                     approval_provider=active_approval_provider,
                     pending_approvals=pending_approvals,
+                    pending_questions=pending_questions,
+                    pending_secrets=pending_secrets,
+                    credential_broker=active_credential_broker,
                 ),
                 media_type="text/event-stream",
             )
@@ -531,6 +782,7 @@ def create_app(
                     conversationId=msg_in.conversation_id,
                     requestId=msg_in.request_id,
                     text=msg_in.text,
+                    agentId=msg_in.agentId,
                 )
             )
             return JSONResponse(status_code=200, content={"reply": reply})
@@ -563,6 +815,9 @@ def create_app(
                 msg_in=msg_in,
                 approval_provider=active_approval_provider,
                 pending_approvals=pending_approvals,
+                pending_questions=pending_questions,
+                pending_secrets=pending_secrets,
+                credential_broker=active_credential_broker,
             ),
             media_type="text/event-stream",
         )
@@ -605,15 +860,59 @@ async def _stream_chat_events(
     msg_in: ChatMessageInput,
     approval_provider: ApprovalProvider | None = None,
     pending_approvals: dict[str, dict[str, Any]] | None = None,
+    pending_questions: dict[str, dict[str, Any]] | None = None,
+    pending_secrets: dict[str, asyncio.Future[dict[str, Any]]] | None = None,
+    credential_broker: CredentialBroker | None = None,
 ) -> AsyncIterator[str]:
-    """Emit AG-UI 1.0 style Server-Sent Events (run lifecycle, progress, tools, approvals, text deltas, done)."""
+    """Emit AG-UI 1.0 Server-Sent Events (run.acknowledged, run.milestone, message.delta, widgets, run.completed)."""
     run_id = f"run-{uuid.uuid4()}"
     msg_id = f"msg-{uuid.uuid4()}"
     event_queue: asyncio.Queue[str | None] = asyncio.Queue()
     emitted_text_start = False
     emitted_any_delta = False
+    session_id = f"web:{user_id}:{msg_in.agentId}:{msg_in.conversation_id}"
+    agent_id = msg_in.agentId
+    sequence = 0
+    start_time = datetime.now(UTC)
+    accumulated_text = ""
+    current_step = 1
 
-    # Emit RunStarted and progress immediately
+    def agui_ev(event_type: str, payload: dict[str, Any]) -> str:
+        nonlocal sequence
+        sequence += 1
+        return format_agui_event(
+            event_type=event_type,
+            payload=payload,
+            run_id=run_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            sequence=sequence,
+        )
+
+    # 1. Immediate cognitive acknowledgment (<300ms, UX-03)
+    yield agui_ev(
+        "run.acknowledged",
+        {
+            "runId": run_id,
+            "intent": msg_in.text[:120],
+            "estimatedSteps": 2,
+        },
+    )
+
+    # 2. Initial milestone stepper event (UX-03)
+    yield agui_ev(
+        "run.milestone",
+        {
+            "step": 1,
+            "totalSteps": 2,
+            "title": "Analyzing task requirements",
+            "status": "running",
+            "detail": msg_in.text[:120],
+            "durationMs": 0,
+        },
+    )
+
+    # 3. Legacy RunStarted and progress events for backward compatibility
     yield format_sse_event(
         "RunStarted",
         {
@@ -634,11 +933,26 @@ async def _stream_chat_events(
     )
 
     async def turn_hook(event_name: str, payload: dict[str, Any]) -> None:
-        nonlocal emitted_text_start, emitted_any_delta
+        nonlocal emitted_text_start, emitted_any_delta, current_step, accumulated_text
         if event_name == "tool_call_start":
+            current_step += 1
             call_id = payload.get("id") or str(uuid.uuid4())
             tool_name = payload.get("name", "")
             clean_args = sanitize_args_summary(payload.get("args", {}))
+            elapsed = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
+            await event_queue.put(
+                agui_ev(
+                    "run.milestone",
+                    {
+                        "step": current_step,
+                        "totalSteps": current_step + 1,
+                        "title": f"Executing tool: {tool_name}",
+                        "status": "running",
+                        "detail": f"Calling {tool_name}",
+                        "durationMs": elapsed,
+                    },
+                )
+            )
             await event_queue.put(
                 format_sse_event(
                     "ToolCallStart",
@@ -667,6 +981,20 @@ async def _stream_chat_events(
             tool_name = payload.get("name", "")
             status = payload.get("status", "success")
             clean_res = sanitize_result_summary(payload.get("result", ""))
+            elapsed = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
+            await event_queue.put(
+                agui_ev(
+                    "run.milestone",
+                    {
+                        "step": current_step,
+                        "totalSteps": current_step + 1,
+                        "title": f"Completed tool: {tool_name}",
+                        "status": "completed" if status == "success" else "failed",
+                        "detail": f"Status: {status}",
+                        "durationMs": elapsed,
+                    },
+                )
+            )
             await event_queue.put(
                 format_sse_event(
                     "ToolCallEnd",
@@ -683,6 +1011,7 @@ async def _stream_chat_events(
         elif event_name == "text_delta":
             delta = payload.get("delta") or payload.get("text") or ""
             if delta:
+                accumulated_text += delta
                 if not emitted_text_start:
                     emitted_text_start = True
                     await event_queue.put(
@@ -698,6 +1027,18 @@ async def _stream_chat_events(
                     )
                 emitted_any_delta = True
                 await event_queue.put(
+                    agui_ev(
+                        "message.delta",
+                        {
+                            "delta": delta,
+                            "accumulated": accumulated_text,
+                            "messageId": msg_id,
+                            "requestId": msg_in.request_id,
+                            "conversationId": msg_in.conversation_id,
+                        },
+                    )
+                )
+                await event_queue.put(
                     format_sse_event(
                         "TextMessageContent",
                         {
@@ -708,6 +1049,74 @@ async def _stream_chat_events(
                         },
                     )
                 )
+        elif event_name == "thought":
+            thought_text = str(payload.get("thought", ""))
+            if thought_text:
+                await event_queue.put(
+                    agui_ev("message.thought", {"thought": thought_text})
+                )
+        elif event_name in ("ask_question", "widget.question"):
+            await web_ask_question(payload)
+        elif event_name in ("secret_request", "widget.secret_request"):
+            await web_request_secret(payload)
+
+    async def web_ask_question(
+        question_payload: dict[str, Any] | QuestionWidget,
+    ) -> dict[str, Any]:
+        if isinstance(question_payload, dict):
+            q = QuestionWidget.model_validate(question_payload)
+        else:
+            q = question_payload
+        q_dict = q.model_dump(by_alias=True)
+        q_dict["requestId"] = msg_in.request_id
+        q_dict["conversationId"] = msg_in.conversation_id
+        q_dict["agentId"] = msg_in.agentId
+
+        await event_queue.put(agui_ev("widget.question", q_dict))
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        if pending_questions is not None:
+            pending_questions[q.question_id] = {
+                "future": fut,
+                "question": q,
+            }
+
+        timeout_sec = (q.timeout_ms or 300_000) / 1000.0
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout_sec)
+        except (TimeoutError, asyncio.CancelledError):
+            return {"error": "timeout", "selectedOptionIds": [], "customText": None}
+        finally:
+            if pending_questions is not None:
+                pending_questions.pop(q.question_id, None)
+
+    async def web_request_secret(
+        req_payload: dict[str, Any] | SecretRequestWidget,
+    ) -> dict[str, Any]:
+        if isinstance(req_payload, dict):
+            sr = SecretRequestWidget.model_validate(req_payload)
+        else:
+            sr = req_payload
+        sr_dict = sr.model_dump(by_alias=True)
+        sr_dict["requestId"] = msg_in.request_id
+        sr_dict["conversationId"] = msg_in.conversation_id
+        sr_dict["agentId"] = msg_in.agentId
+
+        await event_queue.put(agui_ev("widget.secret_request", sr_dict))
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        if pending_secrets is not None:
+            pending_secrets[sr.request_id] = fut
+
+        try:
+            return await asyncio.wait_for(fut, timeout=300.0)
+        except (TimeoutError, asyncio.CancelledError):
+            return {"error": "timeout", "keyName": sr.key_name}
+        finally:
+            if pending_secrets is not None:
+                pending_secrets.pop(sr.request_id, None)
 
     async def web_approve(call: Any, card: Any = None) -> bool:
         action_card: ActionCard | None = None
@@ -739,7 +1148,11 @@ async def _stream_chat_events(
         card_dict = action_card.model_dump(by_alias=True)
         card_dict["requestId"] = msg_in.request_id
         card_dict["conversationId"] = msg_in.conversation_id
+        card_dict["agentId"] = msg_in.agentId
 
+        # AG-UI 1.0 typed approval widget event
+        await event_queue.put(agui_ev("widget.approval_card", card_dict))
+        # Legacy compatibility events
         await event_queue.put(format_sse_event("ActionCard", card_dict))
         await event_queue.put(format_sse_event("approval", card_dict))
 
@@ -754,11 +1167,34 @@ async def _stream_chat_events(
                 "expected_args": call_input,
             }
 
+        async def _watch_provider() -> None:
+            """Watch approval provider for resolution via Telegram or CLI."""
+            while not fut.done():
+                if approval_provider is not None:
+                    rec = approval_provider.get(app_id)
+                    if rec:
+                        if rec.status in ("approved", "consumed"):
+                            if not fut.done():
+                                fut.set_result(True)
+                            break
+                        elif rec.status in ("denied", "expired"):
+                            if not fut.done():
+                                fut.set_result(False)
+                            break
+                await asyncio.sleep(0.05)
+
+        watcher_task = asyncio.create_task(_watch_provider())
         try:
             return await asyncio.wait_for(fut, timeout=300.0)
         except (TimeoutError, asyncio.CancelledError):
             return False
         finally:
+            if not watcher_task.done():
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
             if pending_approvals is not None:
                 pending_approvals.pop(app_id, None)
 
@@ -773,11 +1209,30 @@ async def _stream_chat_events(
                         conversationId=msg_in.conversation_id,
                         requestId=msg_in.request_id,
                         text=msg_in.text,
+                        agentId=msg_in.agentId,
                     ),
                     approve=web_approve,
+                    ask_question=web_ask_question,
                 )
             finally:
                 reset_turn_event_hook(token)
+
+            elapsed_ms = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
+
+            # Final milestone (UX-03)
+            await event_queue.put(
+                agui_ev(
+                    "run.milestone",
+                    {
+                        "step": current_step + 1,
+                        "totalSteps": current_step + 1,
+                        "title": "Turn response completed",
+                        "status": "completed",
+                        "detail": "Synthesized final model response",
+                        "durationMs": elapsed_ms,
+                    },
+                )
+            )
 
             # Fallback if agent did not emit incremental deltas
             if not emitted_text_start:
@@ -793,6 +1248,18 @@ async def _stream_chat_events(
                     )
                 )
             if not emitted_any_delta:
+                await event_queue.put(
+                    agui_ev(
+                        "message.delta",
+                        {
+                            "delta": reply,
+                            "accumulated": reply,
+                            "messageId": msg_id,
+                            "requestId": msg_in.request_id,
+                            "conversationId": msg_in.conversation_id,
+                        },
+                    )
+                )
                 await event_queue.put(
                     format_sse_event(
                         "TextMessageContent",
@@ -828,6 +1295,18 @@ async def _stream_chat_events(
                     },
                 )
             )
+            # AG-UI run.completed event (UX-01)
+            await event_queue.put(
+                agui_ev(
+                    "run.completed",
+                    {
+                        "runId": run_id,
+                        "status": "succeeded",
+                        "summary": reply[:200],
+                        "totalDurationMs": elapsed_ms,
+                    },
+                )
+            )
             # Legacy done event for backward compatibility
             await event_queue.put(
                 format_sse_event(
@@ -852,7 +1331,32 @@ async def _stream_chat_events(
                 )
             )
         except Exception as exc:
+            elapsed_ms = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
             err_msg = "Request failed. Check provider configuration and connectivity."
+            await event_queue.put(
+                agui_ev(
+                    "run.milestone",
+                    {
+                        "step": current_step,
+                        "totalSteps": current_step,
+                        "title": "Turn failed",
+                        "status": "failed",
+                        "detail": err_msg,
+                        "durationMs": elapsed_ms,
+                    },
+                )
+            )
+            await event_queue.put(
+                agui_ev(
+                    "run.completed",
+                    {
+                        "runId": run_id,
+                        "status": "failed",
+                        "summary": err_msg,
+                        "totalDurationMs": elapsed_ms,
+                    },
+                )
+            )
             await event_queue.put(
                 format_sse_event(
                     "error",
@@ -924,6 +1428,7 @@ class WebAdapter:
         memory: Any,
         options: dict[str, Any] | WebAdapterOptions,
         approval_provider: ApprovalProvider | None = None,
+        credential_broker: CredentialBroker | None = None,
     ) -> None:
         if isinstance(options, dict):
             opts = WebAdapterOptions.model_validate(options)
@@ -937,12 +1442,14 @@ class WebAdapter:
         self.memory = memory
         self.options = opts
         self.approval_provider = approval_provider
+        self.credential_broker = credential_broker
         self.app = create_app(
             bus=bus,
             memory=memory,
             token=opts.token,
             user_id=opts.user_id,
             approval_provider=approval_provider,
+            credential_broker=credential_broker,
         )
 
         self._host = opts.host
@@ -1062,17 +1569,26 @@ class WebAdapter:
 app = create_app()
 
 __all__ = [
+    "AgUiEnvelope",
+    "AgentPersona",
     "ApprovalInput",
     "ChatMessageInput",
     "HealthResponse",
     "InboxItem",
+    "MilestoneStep",
+    "QuestionOption",
+    "QuestionWidget",
     "RoutineTarget",
+    "SecretRequestWidget",
+    "SecretSubmitInput",
     "ServerAddress",
     "ServerWrapper",
     "WebAdapter",
     "WebAdapterOptions",
+    "WidgetResolveInput",
     "app",
     "create_app",
+    "format_agui_event",
     "format_sse_event",
     "sanitize_args_summary",
     "sanitize_result_summary",
