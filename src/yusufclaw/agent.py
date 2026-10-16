@@ -13,7 +13,7 @@ from __future__ import annotations
 import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
@@ -21,6 +21,8 @@ from langgraph.graph.message import add_messages
 
 from yusufclaw.memory.context import session_scope
 from yusufclaw.memory.tools import MemoryTool, create_memory_tools
+from yusufclaw.models import get_model_provider
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import (
     Message,
     ModelProvider,
@@ -59,6 +61,7 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     step_count: int
     session_id: str
+    active_provider: NotRequired[ModelProvider | None]
 
 
 class Agent:
@@ -66,7 +69,7 @@ class Agent:
 
     def __init__(
         self,
-        provider: ModelProvider,
+        provider: ModelProvider | None = None,
         memory: Any | None = None,
         system_prompt: str = "You are YusufClaw, an autonomous personal AI agent.",
         tools: Sequence[ToolDefinition] | None = None,
@@ -78,12 +81,20 @@ class Agent:
         skills: str | None = None,
         enable_orchestration: bool = False,
         orchestration_config: OrchestrationConfig | None = None,
+        router: ModelRouter | None = None,
     ) -> None:
         if isinstance(memory, str):
             system_prompt = memory
             memory = None
 
-        self.provider = provider
+        self.router = router
+        if provider is not None:
+            self.provider = provider
+        elif router is not None:
+            self.provider = router.get_provider(ModelRole.DEFAULT)
+        else:
+            self.provider = get_model_provider()
+
         self.memory = memory
         self.system_prompt = system_prompt
         self.skills = skills
@@ -115,6 +126,7 @@ class Agent:
                 config=cfg,
                 tools=self.tools,
                 grants=self.grants,
+                router=self.router,
             )
 
     def get_taint(self, session_id: str) -> SessionTaint:
@@ -197,9 +209,10 @@ class Agent:
                 messages=model_messages,
                 tools=self.tools,
             )
-            async with trace_model_call(self.provider, request) as model_span:
-                response = await self.provider.complete(request)
-                record_model_response(model_span, response, provider=self.provider)
+            active_p = state.get("active_provider") or self.provider
+            async with trace_model_call(active_p, request) as model_span:
+                response = await active_p.complete(request)
+                record_model_response(model_span, response, provider=active_p)
 
             lc_tool_calls: list[dict[str, Any]] = [
                 {
@@ -440,12 +453,16 @@ class Agent:
             return "Conversation cleared."
 
         if self.enable_orchestration and self.orchestrator is not None:
-            async def _direct_turn() -> str:
+            async def _direct_turn(routed_p: ModelProvider | None = None) -> str:
                 original_cb = self.approve_callback
                 if approve_callback is not None:
                     self.approve_callback = approve_callback
                 try:
-                    state = await self.run_state(prompt, session_id=session_id)
+                    state = await self.run_state(
+                        prompt,
+                        session_id=session_id,
+                        provider=routed_p,
+                    )
                     for msg in reversed(state["messages"]):
                         if isinstance(msg, AIMessage):
                             return str(msg.content)
@@ -472,7 +489,12 @@ class Agent:
         finally:
             self.approve_callback = original_cb
 
-    async def run_state(self, prompt: str, session_id: str = "default") -> AgentState:
+    async def run_state(
+        self,
+        prompt: str,
+        session_id: str = "default",
+        provider: ModelProvider | None = None,
+    ) -> AgentState:
         """Run a conversational turn and return the final LangGraph state."""
         async with trace_agent_turn(session_id=session_id) as turn_span:
             initial_state: AgentState = {
@@ -480,6 +502,8 @@ class Agent:
                 "step_count": 0,
                 "session_id": session_id,
             }
+            if provider is not None:
+                initial_state["active_provider"] = provider
             final_state: AgentState = await self.graph.ainvoke(initial_state)
             if turn_span.is_recording():
                 turn_span.set_attribute("yusufclaw.turn.step_count", final_state.get("step_count", 0))
@@ -546,12 +570,14 @@ class Agent:
                 self.approve_callback = approve
             try:
                 if self.enable_orchestration and self.orchestrator is not None:
-                    async def _direct_turn() -> str:
+                    async def _direct_turn(routed_p: ModelProvider | None = None) -> str:
                         state: AgentState = {
                             "messages": [*history_messages, HumanMessage(content=text)],
                             "step_count": 0,
                             "session_id": session,
                         }
+                        if routed_p is not None:
+                            state["active_provider"] = routed_p
                         async with trace_agent_turn(session_id=session, request_id=request_id) as turn_span:
                             res_state: AgentState = await self.graph.ainvoke(state)
                             if turn_span.is_recording():
