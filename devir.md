@@ -1,67 +1,82 @@
-# Devir ve Mimari Dokümanı — Phase 2 Tools
+# Devir ve Mimari Dokümanı — Phase 3 Security Sprint
 
 ## 1. Genel Durum
-Bu dal (`phase2-tools`), SPEC.md'de tanımlanan Phase 2 araç setini (`packages/tools`) ve çekirdek döngü onay entegrasyonunu eksiksiz olarak uygular. Diğer daldaki (`phase2-models-web`) çalışma alanlarına (`packages/models`, `packages/infra`, `gateway` web chat) dokunulmamıştır.
+Bu dal (`phase3-security`), `docs/RESEARCH-ASIST.md` (§1.3 ve Yol Haritası Tablosu) içerisinde belirlenen P0 güvenlik açıklarını ve tehdit modellerini kapatan Güvenlik Sprinti'ni (YC-01, YC-02, YC-03, YC-05, YC-10) eksiksiz olarak uygular. 
 
-## 2. Gerçekleştirilen Bileşenler (`packages/tools`)
+AWS altyapısına (`packages/infra`) kesinlikle dokunulmamış, tüm mevcut testler korunmuş ve her madde ayrı commit'lerle kaydedilmiştir.
 
-### 2.1 Sandboxed Shell Tool (`shell`)
-- **Dosya**: `packages/tools/src/shell.ts`
-- **İşlev**: Komutları çalışma alanı dizini (`workspaceDir`) içinde çalıştırır.
-- **İzin Listesi (Allowlist)**: `DEFAULT_ALLOWED_COMMANDS` listesi ile kısıtlıdır. İzin verilmeyen ikililer reddedilir.
-- **Onay Kontrolü (`isDangerousCommand`)**:
-  - Salt okunur güvenli komutlar (`ls`, `cat`, `head`, `tail`, `grep`, `pwd`, `git status`, `git diff`, `node -v` vb.) onaysız çalışır.
-  - Yıkıcı ve değiştirici komutlar (`rm`, `mv`, `mkdir`, `kill`, `chmod`, `git commit`, `git reset`, `pnpm install`, çıktı yönlendirme `>` / `>>` vb.) kullanıcı onayı (`requiresApproval: true`) gerektirir.
-- **Güvenlik & Sınırlar**: Dizin kaçışını (`cwd`) engeller, zaman aşımı (varsayılan 30s, maks 60s) ve çıktı sınırı (32.000 karakter) uygular. AbortSignal ile alt süreç ağacını sonlandırır.
+---
 
-### 2.2 Scoped File Tools (`file_read`, `file_write`, `file_list`)
-- **Dosya**: `packages/tools/src/files.ts`
-- **İşlev**: Dosya okuma, yazma ve listeleme işlemlerini yalnızca `workspaceRoot` sınırları içinde gerçekleştirir.
-- **Güvenlik (`resolveSafePath`)**:
-  - `../` göreli yol aşımı engellenir.
-  - Çalışma alanı dışındaki mutlak yollar (`/etc/passwd` vb.) engellenir.
-  - Null-byte (`\0`) saldırıları engellenir.
-  - Çalışma alanı dışına işaret eden symlink'ler (hem mevcut dosyalar hem üst dizinler için) `realpathSync` ile kontrol edilerek engellenir.
-- **Onay**:
-  - `file_read`: Onay gerektirmez (`requiresApproval: false`), boyut sınırına (varsayılan 64KB, maks 1MB) tabidir.
-  - `file_write`: Dosya sistemi değişikliği yaptığı için onay gerektirir (`requiresApproval: true`). Gerekli üst dizinleri güvenli izinlerle otomatik oluşturur.
-  - `file_list`: Onay gerektirmez (`requiresApproval: false`), recursive destekler, `maxEntries` ile sınırlandırılır.
+## 2. Gerçekleştirilen Güvenlik Modülleri
 
-### 2.3 Web Fetch Tool (`web_fetch`)
-- **Dosya**: `packages/tools/src/fetch.ts`
-- **İşlev**: Güvenli HTTP/HTTPS istekleri atar.
-- **Güvenlik**:
-  - Sadece `http:` ve `https:` protokollerine izin verilir (`file:`, `ftp:` vb. engellenir).
-  - SSRF Koruması: Bulut metadata IP'leri (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`, `100.100.100.200`) engellenir.
-  - Akış Boyut Sınırı: Yanıt gövdesi stream reader ile okunarak `maxBytes` (varsayılan 100KB, maks 1MB) aşımında akış iptal edilir, bellek şişmesi önlenir.
-  - Zaman aşımı ve iptal sinyali entegrasyonu mevcuttur.
-  - Birim testleri için enjekte edilebilir `fetcher` arayüzü sunar.
+### 2.1 YC-01: Çalışma Alanı İzolasyonu ve Kısıtlı Yollar
+- **Commit:** `8c30597`
+- **Dosyalar:** `packages/tools/src/files.ts`, `packages/tools/src/shell.ts`, `packages/tools/src/index.ts`
+- **İşlev:**
+  - `DEFAULT_WORKSPACE_DIR` deposu kökünden `.data/workspace` dizinine taşındı.
+  - `isRestrictedSecretPath` ile `.env*`, `*.sqlite`, `~/.aws`, `.git/config`, SSH anahtarları için mutlak okuma reddi konuldu.
+  - Shell aracında `containsRestrictedPath` ile argümanlardaki kaçışlar (`cat ../.env`, `cat ~/.aws/credentials`) engellendi.
 
-### 2.4 Playwright Browser Tool (`browser`)
-- **Dosya**: `packages/tools/src/browser.ts`
-- **İşlev**: Sayfa başlığı, metni veya HTML içeriğini alma (`navigate`, `content`, `title`).
-- **Opsiyonel Bağımlılık**: Playwright yüklü değilse çökmez; kullanıcıya kurulum komutunu (`pnpm add -D playwright && npx playwright install`) bildiren nazik bir açıklama döner.
-- **Kaynak Temizliği**: `finally` bloklarında `page`, `context` ve `browser` örneklerinin kapatılması garanti edilir.
-- **Test Edilebilirlik**: Pluggable `launcher` desteği sayesinde gerçek tarayıcı ikilisi olmadan tüm yaşam döngüsü test edilebilir.
+### 2.2 YC-02: SSRF DNS ve Yönlendirme Doğrulaması
+- **Commit:** `ab4324c`
+- **Dosyalar:** `packages/tools/src/fetch.ts`, `packages/tools/src/browser.ts`
+- **İşlev:**
+  - RFC1918, loopback, link-local, multicast, IPv4-mapped IPv6 adresleri ve bulut metadata IP/alan adları engellendi.
+  - `validateHostSSRF` hem doğrudan IP'leri hem de DNS çözümlemesi (`dns.lookup({ all: true })`) sonucundaki adresleri denetler.
+  - `web_fetch` için 5 sekmeli manuel redirect döngüsü kuruldu; her sekmede SSRF kontrolü tekrarlanır.
+  - `browser` (Playwright) aracına istek öncesi SSRF doğrulaması eklendi.
 
-### 2.5 Delegate to Local Agents Tool (`delegate_agent`)
-- **Dosya**: `packages/tools/src/delegate.ts`
-- **İşlev**: `agy -p <prompt>` veya `codex exec <prompt>` alt süreçlerini çalıştırır.
-- **Güvenlik Kapısı**: `ENABLE_AGENT_DELEGATION=true` (veya `1`) ortam değişkeni tanımlı değilse devre dışıdır.
-- **Onay**: Otonom kod çalıştırabilen yerel ajan çağrıları her zaman onay gerektirir (`requiresApproval: true`).
-- **Sınırlar**: Çalışma dizini workspace içinde tutulur, zaman aşımı ve çıktı sınırları uygulanır.
+### 2.3 YC-03: ToolManifest, Deterministik Politika ve Oturum Kirlenmesi
+- **Commit:** `faceedc`
+- **Dosyalar:** `packages/tools/src/manifest.ts`, `packages/core/src/policy/`, `packages/core/src/agent.ts`
+- **İşlev:**
+  - `ToolManifest` arayüzü ile araç efektleri (`read_untrusted`, `exec`, `egress`, `spend`, vb.) ve kaynak bilgileri tiplendirildi.
+  - `policy.decide()` motoru ile Willison Lethal Trifecta engeli konuldu: Kirlenmiş oturumda `egress`, `send_message`, `spend`, `exec` eylemleri kullanıcı onaysız (ActionCard'sız) çalışamaz.
+  - `Agent.run` döngüsüne `taints` oturum hafızası eklendi; `read_untrusted` araçları oturumu kirlenmiş (`contaminated`) yapar.
 
-### 2.6 Core Agent Loop & Approval Uyarlaması
-- **Dosyalar**: `packages/tools/src/index.ts`, `packages/core/src/agent.ts`, `packages/gateway/src/main.ts`
-- `AgentTool.requiresApproval` alanı `boolean | ((input: Record<string, unknown>) => boolean)` tipine genişletildi.
-- Çekirdek ajan döngüsünde (`packages/core/src/agent.ts`), `entry.tool.requiresApproval` fonksiyon veya boolean olarak dinamik değerlendirilir.
-- Böylece güvenli shell komutları kullanıcıyı yormadan akarken, yıkıcı shell komutları ve dosya yazma işlemleri CLI'da kullanıcıya `Type yes:` şeklinde sorulur, Telegram ve tek seferlik CLI'da ise güvenli şekilde reddedilir (`Tool approval denied`).
-- `createDefaultTools()` fabrikası tüm Phase 2 araçlarını `current_time` ile birlikte döner ve `packages/gateway/src/main.ts` içinde ajana kaydedilmiştir.
+### 2.4 YC-05: ActionCard ve Telegram Inline Onay Sistemi
+- **Commit:** `5750706`
+- **Dosyalar:** `packages/core/src/policy/cards.ts`, `packages/gateway/src/telegram.ts`
+- **İşlev:**
+  - `ActionCard` yapısı ve `ActionCardStore` uygulandı (16 bayt kriptografik nonce, 5 dk TTL, kanonik JSON argüman SHA-256 özeti, tek seferlik atomik tüketim).
+  - Tekrar oynatma (*replay*) ve onay sonrası argüman değişikliği (*argument tampering*) reddedilir.
+  - Telegram adapter'ına inline klavye butonları (`approve`, `deny`, `details`) ve `callback_query` işleyicisi eklendi.
+  - **Consent Integrity:** Onay kartı metni kesinlikle LLM serbest metninden üretilmez; yalnızca deterministik kart şablonundan oluşturulur.
 
-## 3. Doğrulama ve Testler
-- **İzole Araç Zinciri**: Node v20.20.2 (`/home/yusuf/.npm/_npx/4d903b83cb5f3f5a/node_modules/node/bin/node`) ve pnpm 9.15.9 kullanılmıştır. Sistem küresel kurulumuna dokunulmamıştır.
-- **Test Kapsamı**: `tests/tools.test.ts` eklenmiş olup, 5 test dosyasında toplam **44 testin tamamı** eksiksiz ve yeşil olarak geçmektedir (`pnpm check` exit code: 0).
+### 2.5 YC-10: Güvenlik Değerlendirme Paketi (`evals/`) ve CI
+- **Commit:** `84dd704`
+- **Dosyalar:** `evals/types.ts`, `evals/runner.ts`, `evals/fixtures/*.yaml`, `tests/evals.test.ts`
+- **İşlev:**
+  - YAML formatında 12 senaryo (8 saldırı, 4 zararsız görev) içeren deterministik test koşucusu geliştirildi.
+  - Egress isteklerini yakalayan test proxy mekanizması kuruldu.
+  - **Metrikler:**
+    - Attack Success Rate (ASR): **%0.00** (0 / 8 saldırı başarılı)
+    - Benign Task Success Rate: **%100.00** (4 / 4 zararsız görev tamamlandı)
+    - ActionCards Generated: **5** (Onay yükü raporlandı)
+  - `pnpm evals` ve `pnpm check` komutlarına entegre edildi.
+
+---
+
+## 3. Test ve Bütünlük Durumu
+
+- **Node Sürümü:** Node >= 20.19 (Ortamda: `/home/yusuf/.nvm/versions/node/v22.22.3/bin/node`).
+- **Paket Derlemesi (`tsc -b`):** 0 hata.
+- **Tip Kontrolü (`tsc -p tsconfig.tests.json`):** 0 hata.
+- **Vitest Test Paketi:** 10 dosya, 83 testin tamamı geçti (`PASS`).
+- **AWS CDK Jest Paketi:** 1 dosya, 6 testin tamamı geçti (`PASS`).
+- **Toplam Test:** 89 test eksiksiz geçti.
+- **AWS İzolasyonu:** `packages/infra` paketine dokunulmamıştır.
+
+---
 
 ## 4. Sonraki Ajan İçin Notlar
-- `phase2-models-web` dalı birleştirildiğinde `packages/tools` ve `packages/core` çakışmasız entegre olacaktır.
-- `packages/models` veya `packages/infra` paketlerinde hiçbir değişiklik yapılmamıştır.
+
+1. Node komutlarını çalıştırırken Node 22 yolunu önekleyin:
+   ```bash
+   PATH="/home/yusuf/.nvm/versions/node/v22.22.3/bin:$PATH" pnpm check
+   ```
+2. Güvenlik sprinti tamamlandığı için `docs/RESEARCH-ASIST.md` tablosundaki bir sonraki aşamalar:
+   - **YC-04:** Shell için sandbox entegrasyonu (bubblewrap / podman).
+   - **YC-06:** Olay günlüğü (`runs` ve `run_events` tabloları).
+   - **YC-07 / YC-08:** Kalıcı bellek şeması ve `/forget` komutu.
+3. `SECURITY-SPRINT.md` dosyası bu sprintin eksiksiz teknik referansını içerir.
