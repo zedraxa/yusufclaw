@@ -198,3 +198,64 @@ Deep paper/project research completed in `~/projects/yusufclaw-research` and cop
 - `docs/DESIGN-RECOMMENDATIONS.md` — ADRs, package contracts, P0/P1/P2 ticket roadmap
 
 Codex research unit exited with ChatGPT usage limit after writing both files; deliverables are complete and self-contained. No AWS deploy. Next implementation priority from the design roadmap: durable structured memory (P0-07 / P1-02–03) on top of the merged Phase 2 main.
+
+# Phase 3 memory progress
+
+Phase 3 durable structured memory per DESIGN recommendations (tickets P0-07 and the first slice of P1-02/P1-03) is complete on branch `phase3-memory`.
+
+## Built
+
+- **Preserved turn history & replay (`SqliteMemory`)**:
+  - Existing `turns` table, session isolation, request ID replay deduplication, and `/reset` command functionality remain fully intact and backward-compatible.
+  - `/reset` cleans turn history without erasing durable structured user profile facts.
+
+- **Durable structured memory structures**:
+  - `memory_records` table with three memory kinds:
+    - Profile facts (`kind: 'profile'`): enduring user preferences, traits, and identity attributes.
+    - Episodic notes (`kind: 'note'`): meeting summaries, timestamps, and conversation notes.
+    - User/project facts (`kind: 'fact'`): revisable and forgettable state facts.
+  - Full provenance tracking: source identity (`user_explicit`, `agent_tool`, etc.), source IDs (`requestId` / turn linkage), trust levels (`user_explicit`, `observed`, `model_inferred`, `external`), creation/update timestamps (`created_at`, `updated_at`), validity intervals (`valid_from`, `valid_to`), and supersession links (`supersedes_id`, `superseded_by_id`).
+  - Revision history: `memory_revisions` table tracking previous revisions, timestamps, reasons, and provenance.
+  - Optimistic concurrency control (CAS): `expectedRevision` parameter in `revise` protects against stale competing edits.
+  - Soft deletion and tombstones: `memory_deletions` table recording audit tombstones upon forgetting.
+
+- **SQLite FTS5 lexical retrieval & ranking**:
+  - Native SQLite virtual table `memory_fts` indexing `text` and `category`.
+  - BM25 relevance rank ordering (`ORDER BY f.rank`).
+  - Safe Unicode-aware token query sanitization (`sanitizeFts5Query`), protecting against punctuation, quotes, operator syntax crashes, and full support for Turkish diacritics (`İstanbul`, `çay`, etc.).
+  - Automatic FTS index synchronization on memory insertions, revisions, supersessions, and deletions. Deleted and superseded facts are purged from `memory_fts` to guarantee clean active-only search results.
+  - Optional embedding provider interface (`EmbeddingProvider`, `SqliteMemoryOptions`) retained and disabled by default.
+
+- **Agent-facing memory tools (`packages/core/src/memory-tools.ts`)**:
+  - `remember`: stores profile facts, notes, or user facts with evidence IDs (`[mem_...]`). Supports replacing older memories via `supersedesId`.
+  - `revise`: updates an existing memory by ID, incrementing its revision and recording previous version in history, with optional optimistic concurrency (`expectedRevision`).
+  - `forget`: soft-deletes a memory by ID, purging it from FTS index and active retrieval while logging an audit tombstone.
+  - `recall`: searches long-term memory via FTS5 with BM25 ranking and evidence ID formatting.
+  - Automatic registration in `Agent` loop (configurable via `options.memoryTools`).
+
+- **Context assembly & scope isolation**:
+  - Bounded, labeled context assembler (`assembleContext`):
+    - Fetches active profile facts and query-relevant memories with explicit evidence IDs (`[Evidence: mem_...]`).
+    - Labels sections distinctly (`### Profile`, `### Relevant Facts & Notes`) to ensure data is clearly marked as contextual data rather than raw system instructions.
+    - Enforces hard item count (`maxEntries`) and character length bounds (`maxChars`).
+  - Async session tracking (`activeSessionContext` via `AsyncLocalStorage`):
+    - Completely prevents race conditions across concurrent sessions and channels.
+    - Enforces per-session/channel scope isolation: memories stored in one session cannot be read, updated, searched, or deleted from another session.
+
+## Verification
+
+Verified with isolated Node v20.20.2 and pnpm 9.15.9:
+- `pnpm typecheck` passed cleanly across all packages and test suites.
+- `pnpm test` and `pnpm check` passed: **78 Vitest tests across 10 test files + 6 infra Jest tests (84 total tests passing)**.
+- New test suite `tests/memory.test.ts` covers 10 comprehensive scenarios:
+  1. Restart recall across file-backed SQLite database closes and reopenings.
+  2. Supersession mechanics, revision increments, and active-search exclusion of superseded facts.
+  3. Scope isolation between distinct sessions and channels.
+  4. Deletion removing records from active retrieval, FTS index, and list APIs while preserving tombstones.
+  5. FTS5 search with prefix matching, BM25 ranking, Turkish characters, and symbol query sanitization.
+  6. Optimistic concurrency control (CAS) and revision history retention.
+  7. Bounded and labeled context assembly with evidence IDs.
+  8. Agent loop integration with model tool calls (`remember`, `revise`, `forget`, `recall`).
+  9. Preservation of turn history and `/reset` behavior.
+  10. Direct `createMemoryTools` execution and schema validation.
+

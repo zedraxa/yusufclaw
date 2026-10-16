@@ -1,67 +1,80 @@
-# Devir ve Mimari Dokümanı — Phase 2 Tools
+# Devir ve Mimari Dokümanı — Phase 3 Memory
 
 ## 1. Genel Durum
-Bu dal (`phase2-tools`), SPEC.md'de tanımlanan Phase 2 araç setini (`packages/tools`) ve çekirdek döngü onay entegrasyonunu eksiksiz olarak uygular. Diğer daldaki (`phase2-models-web`) çalışma alanlarına (`packages/models`, `packages/infra`, `gateway` web chat) dokunulmamıştır.
+Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03 ilk dilimi) belirtilen kalıcı yapılandırılmış bellek (durable structured memory) mimarisini eksiksiz olarak uygular.
 
-## 2. Gerçekleştirilen Bileşenler (`packages/tools`)
+Önceki aşamalardan gelen `packages/tools`, `packages/infra`, `packages/models` ve `packages/gateway` paketlerinin ana işleyişi bozulmamış, gereksiz yeniden yazımlardan kaçınılmıştır.
 
-### 2.1 Sandboxed Shell Tool (`shell`)
-- **Dosya**: `packages/tools/src/shell.ts`
-- **İşlev**: Komutları çalışma alanı dizini (`workspaceDir`) içinde çalıştırır.
-- **İzin Listesi (Allowlist)**: `DEFAULT_ALLOWED_COMMANDS` listesi ile kısıtlıdır. İzin verilmeyen ikililer reddedilir.
-- **Onay Kontrolü (`isDangerousCommand`)**:
-  - Salt okunur güvenli komutlar (`ls`, `cat`, `head`, `tail`, `grep`, `pwd`, `git status`, `git diff`, `node -v` vb.) onaysız çalışır.
-  - Yıkıcı ve değiştirici komutlar (`rm`, `mv`, `mkdir`, `kill`, `chmod`, `git commit`, `git reset`, `pnpm install`, çıktı yönlendirme `>` / `>>` vb.) kullanıcı onayı (`requiresApproval: true`) gerektirir.
-- **Güvenlik & Sınırlar**: Dizin kaçışını (`cwd`) engeller, zaman aşımı (varsayılan 30s, maks 60s) ve çıktı sınırı (32.000 karakter) uygular. AbortSignal ile alt süreç ağacını sonlandırır.
+## 2. Gerçekleştirilen Mimari Bileşenler (`packages/core`)
 
-### 2.2 Scoped File Tools (`file_read`, `file_write`, `file_list`)
-- **Dosya**: `packages/tools/src/files.ts`
-- **İşlev**: Dosya okuma, yazma ve listeleme işlemlerini yalnızca `workspaceRoot` sınırları içinde gerçekleştirir.
-- **Güvenlik (`resolveSafePath`)**:
-  - `../` göreli yol aşımı engellenir.
-  - Çalışma alanı dışındaki mutlak yollar (`/etc/passwd` vb.) engellenir.
-  - Null-byte (`\0`) saldırıları engellenir.
-  - Çalışma alanı dışına işaret eden symlink'ler (hem mevcut dosyalar hem üst dizinler için) `realpathSync` ile kontrol edilerek engellenir.
-- **Onay**:
-  - `file_read`: Onay gerektirmez (`requiresApproval: false`), boyut sınırına (varsayılan 64KB, maks 1MB) tabidir.
-  - `file_write`: Dosya sistemi değişikliği yaptığı için onay gerektirir (`requiresApproval: true`). Gerekli üst dizinleri güvenli izinlerle otomatik oluşturur.
-  - `file_list`: Onay gerektirmez (`requiresApproval: false`), recursive destekler, `maxEntries` ile sınırlandırılır.
+### 2.1 Mevcut SqliteMemory Geçmişinin Korunması
+- **Dosya**: `packages/core/src/memory.ts`
+- **İşlev**: `turns` tablosu, `state` anahtar-değer deposu, `/reset` komutu ile sohbet oturumu sıfırlama, oturum izolasyonu (`session`) ve `request_id` replay deduplication yetenekleri %100 geriye dönük uyumlu biçimde korunmuştur.
+- `/reset` çalıştırıldığında sadece sohbet turn geçmişi temizlenir; kullanıcının kalıcı profil ve olgusal hafızası (durable memory) silinmez.
 
-### 2.3 Web Fetch Tool (`web_fetch`)
-- **Dosya**: `packages/tools/src/fetch.ts`
-- **İşlev**: Güvenli HTTP/HTTPS istekleri atar.
-- **Güvenlik**:
-  - Sadece `http:` ve `https:` protokollerine izin verilir (`file:`, `ftp:` vb. engellenir).
-  - SSRF Koruması: Bulut metadata IP'leri (`169.254.169.254`, `fd00:ec2::254`, `metadata.google.internal`, `100.100.100.200`) engellenir.
-  - Akış Boyut Sınırı: Yanıt gövdesi stream reader ile okunarak `maxBytes` (varsayılan 100KB, maks 1MB) aşımında akış iptal edilir, bellek şişmesi önlenir.
-  - Zaman aşımı ve iptal sinyali entegrasyonu mevcuttur.
-  - Birim testleri için enjekte edilebilir `fetcher` arayüzü sunar.
+### 2.2 Yapılandırılmış Bellek Tabloları ve Veri Modeli
+- **Tablolar**:
+  - `memory_records`: Kalıcı bellek kayıtları.
+    - `id`: Benzersiz kanıt kimliği (Evidence ID, örn: `mem_m8x2k1_a3f9c2d1`).
+    - `scope`: Oturum / kanal kapsamı (Session / channel scope isolation).
+    - `kind`: `'profile'` (kullanıcı tercih ve özellikleri), `'note'` (olay/toplantı notları), `'fact'` (güncellenebilir olgular).
+    - `text`: Bellek metni.
+    - `category`: İsteğe bağlı etiket / konu.
+    - `source` & `source_ids`: Kanıt ve kaynak takibi (provenance, `requestId`, oturum).
+    - `trust`: Güven seviyesi (`user_explicit`, `observed`, `model_inferred`, `external`).
+    - `created_at`, `updated_at`: Zaman damgaları.
+    - `valid_from`, `valid_to`: Geçerlilik aralıkları.
+    - `supersedes_id`, `superseded_by_id`: Eski olguların yerini alma (supersession) bağlantıları.
+    - `revision`: Pozitif revizyon numarası (1'den başlar).
+    - `status`: `'active'`, `'superseded'`, `'deleted'`.
+    - `deleted_at`: Silinme zaman damgası.
+  - `memory_revisions`: Revizyon geçmişi tablosu (eski metin, güncelleme nedeni, kaynak ve revizyon numarası).
+  - `memory_deletions`: Silinen kayıtlar için denetim tombstones günlüğü.
+  - `memory_fts`: SQLite FTS5 sanal tablosu (`record_id`, `scope`, `kind`, `text`, `category`).
 
-### 2.4 Playwright Browser Tool (`browser`)
-- **Dosya**: `packages/tools/src/browser.ts`
-- **İşlev**: Sayfa başlığı, metni veya HTML içeriğini alma (`navigate`, `content`, `title`).
-- **Opsiyonel Bağımlılık**: Playwright yüklü değilse çökmez; kullanıcıya kurulum komutunu (`pnpm add -D playwright && npx playwright install`) bildiren nazik bir açıklama döner.
-- **Kaynak Temizliği**: `finally` bloklarında `page`, `context` ve `browser` örneklerinin kapatılması garanti edilir.
-- **Test Edilebilirlik**: Pluggable `launcher` desteği sayesinde gerçek tarayıcı ikilisi olmadan tüm yaşam döngüsü test edilebilir.
+### 2.3 SQLite FTS5 Tabanlı Arama & Sıralama
+- Doğal FTS5 BM25 alaka düzeyi puanlaması (`ORDER BY f.rank`).
+- `sanitizeFts5Query`: Özel semboller, tırnaklar, operatörler ve noktalama işaretlerinin FTS5 sözdizimi hatası vermesini önleyen Unicode-destekli belirteç temizleyici.
+- Türkçe karakterler (`İstanbul`, `Türkçe`, `çay` vb.) ve önek araması (`"Type"*`) sorunsuz desteklenir.
+- Bir kayıt silindiğinde veya yerine yenisi geçtiğinde (supersession) FTS5 tablosundan kaldırılarak aktif aramalarda görünmemesi garanti edilir.
+- İsteğe bağlı embedding arayüzü (`EmbeddingProvider`, `SqliteMemoryOptions`) hazır bırakılmış, varsayılan olarak kapalı tutulmuştur.
 
-### 2.5 Delegate to Local Agents Tool (`delegate_agent`)
-- **Dosya**: `packages/tools/src/delegate.ts`
-- **İşlev**: `agy -p <prompt>` veya `codex exec <prompt>` alt süreçlerini çalıştırır.
-- **Güvenlik Kapısı**: `ENABLE_AGENT_DELEGATION=true` (veya `1`) ortam değişkeni tanımlı değilse devre dışıdır.
-- **Onay**: Otonom kod çalıştırabilen yerel ajan çağrıları her zaman onay gerektirir (`requiresApproval: true`).
-- **Sınırlar**: Çalışma dizini workspace içinde tutulur, zaman aşımı ve çıktı sınırları uygulanır.
+### 2.4 Ajan Bellek Araçları (`packages/core/src/memory-tools.ts`)
+- `remember`: Yeni profil tercihi, not veya olgusal bellek kaydeder; kanıt kimliği (evidence ID) döner. `supersedesId` verilirse eski kaydı arşivler.
+- `revise`: Var olan kaydı kanıt kimliğiyle günceller, revizyonu artırır, geçmişe yazar. İsteğe bağlı `expectedRevision` ile Optimistic Concurrency Control (CAS) sağlar.
+- `forget`: Belirtilen kanıt kimliğine sahip kaydı aktif aramadan kaldırır, FTS5'ten siler ve silinme günlüğü (tombstone) oluşturur.
+- `recall`: Oturuma izole edilmiş FTS5 araması yapar; kanıt kimlikleri, revizyon ve kategoriyle biçimlendirilmiş sonuç döner.
 
-### 2.6 Core Agent Loop & Approval Uyarlaması
-- **Dosyalar**: `packages/tools/src/index.ts`, `packages/core/src/agent.ts`, `packages/gateway/src/main.ts`
-- `AgentTool.requiresApproval` alanı `boolean | ((input: Record<string, unknown>) => boolean)` tipine genişletildi.
-- Çekirdek ajan döngüsünde (`packages/core/src/agent.ts`), `entry.tool.requiresApproval` fonksiyon veya boolean olarak dinamik değerlendirilir.
-- Böylece güvenli shell komutları kullanıcıyı yormadan akarken, yıkıcı shell komutları ve dosya yazma işlemleri CLI'da kullanıcıya `Type yes:` şeklinde sorulur, Telegram ve tek seferlik CLI'da ise güvenli şekilde reddedilir (`Tool approval denied`).
-- `createDefaultTools()` fabrikası tüm Phase 2 araçlarını `current_time` ile birlikte döner ve `packages/gateway/src/main.ts` içinde ajana kaydedilmiştir.
+### 2.5 Bağlam Derleme & Oturum İzolasyonu (Context Assembly)
+- **Dosyalar**: `packages/core/src/agent.ts`, `packages/core/src/session-context.ts`
+- `activeSessionContext`: `AsyncLocalStorage` kullanılarak eşzamanlı oturumlarda ve asenkron araç yürütmelerinde yarış durumları (race condition) olmadan etkin oturum takip edilir.
+- `assembleContext`:
+  - Modele aktarılan bellekler ham metin olarak dökülmez (`not dumped raw`).
+  - Açıkça etiketlenir (`## Active Memory Context`, `### Profile`, `### Relevant Facts & Notes`).
+  - Her madde kanıt kimliği (`[Evidence: mem_...]`), revizyon ve kategori içerir.
+  - Maksimum kayıt adedi (`maxEntries`, varsayılan 10) ve karakter sınırı (`maxChars`, varsayılan 2000) ile sıkı şekilde sınırlandırılır.
 
 ## 3. Doğrulama ve Testler
-- **İzole Araç Zinciri**: Node v20.20.2 (`/home/yusuf/.npm/_npx/4d903b83cb5f3f5a/node_modules/node/bin/node`) ve pnpm 9.15.9 kullanılmıştır. Sistem küresel kurulumuna dokunulmamıştır.
-- **Test Kapsamı**: `tests/tools.test.ts` eklenmiş olup, 5 test dosyasında toplam **44 testin tamamı** eksiksiz ve yeşil olarak geçmektedir (`pnpm check` exit code: 0).
+- **İzole Araç Zinciri**: Node v20.20.2 ve pnpm 9.15.9 kullanılmıştır.
+- **Tip Kontrolü**: `pnpm typecheck` (`tsc -b && tsc -p tsconfig.tests.json`) sıfır hata ile geçti.
+- **Birim & Entegrasyon Testleri**:
+  - `tests/memory.test.ts` eklendi (10 kapsamlı test senaryosu).
+  - Vitest: **10 test dosyasında 78 testin tamamı** yeşil geçti.
+  - Infra Jest: **1 suite içinde 6 testin tamamı** yeşil geçti.
+  - Toplam **84 test** eksiksiz ve yeşil olarak doğrulanmıştır (`pnpm check` exit code: 0).
+- **Test Edilen Kritik Senaryolar**:
+  1. Restart recall (diske yazılı SQLite veritabanı kapatılıp açıldıktan sonra eksiksiz hatırlama ve FTS5 araması).
+  2. Supersession (eski olgunun yerini yenisinin alması, revizyon artışı, eski olgunun aktif aramadan düşmesi, tarihsel incelemede kalması).
+  3. Scope isolation (farklı oturum ve kanalların birbirinin belleğini okuyamaması, güncelleyememesi, silememesi).
+  4. Deletion removes from active retrieval (silinen kaydın aktif aramadan, get ve list metotlarından çıkması, tombstone kaydı).
+  5. FTS5 arama temelleri (önek, BM25 sıralaması, Türkçe karakterler, sembol arındırma).
+  6. Optimistic concurrency (CAS) ve revizyon geçmişi.
+  7. Bounded & labeled context assembly (etiketli bölümler, kanıt kimlikleri, sınırlandırma).
+  8. Ajan döngüsü araç kullanımı (`remember`, `revise`, `forget`, `recall`).
+  9. Mevcut turn geçmişi ve `/reset` davranışı ile uyumluluk.
+  10. `createMemoryTools` doğrudan çağrı ve şema doğrulaması.
 
 ## 4. Sonraki Ajan İçin Notlar
-- `phase2-models-web` dalı birleştirildiğinde `packages/tools` ve `packages/core` çakışmasız entegre olacaktır.
-- `packages/models` veya `packages/infra` paketlerinde hiçbir değişiklik yapılmamıştır.
+- Bellek altyapısı `packages/core` içinde tamamen hazır ve `packages/gateway` tarafından doğrudan kullanılabilir durumdadır.
+- AWS altyapısına henüz deploy yapılmamıştır (`packages/infra` kuralları korunmuştur).
+- Git dalı `phase3-memory` üzerindedir; uzak depoya push yapılmamalıdır.
