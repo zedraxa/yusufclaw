@@ -11,7 +11,6 @@ import signal
 import sys
 from typing import Any
 
-from yusufclaw.agent import Agent
 from yusufclaw.gateway.bus import MessageBus
 from yusufclaw.gateway.cli import run_cli
 from yusufclaw.gateway.config import GatewayConfig, load_config
@@ -30,6 +29,7 @@ async def async_main(args: list[str] | None = None) -> None:
         sys.stdout.write(
             "Usage: yusufclaw cli [--message TEXT] [--session NAME]\n"
             "       yusufclaw telegram\n"
+            "       yusufclaw whatsapp\n"
             "       yusufclaw web\n"
             "Configure .env using .env.example.\n"
         )
@@ -39,8 +39,8 @@ async def async_main(args: list[str] | None = None) -> None:
     mode = raw_args[0]
     extra_args = raw_args[1:]
 
-    if mode not in ("cli", "telegram", "web", "routines"):
-        raise ValueError("Choose cli, telegram, web, or routines")
+    if mode not in ("cli", "telegram", "web", "routines", "whatsapp"):
+        raise ValueError("Choose cli, telegram, web, routines, or whatsapp")
 
     config: GatewayConfig = load_config()
 
@@ -48,6 +48,12 @@ async def async_main(args: list[str] | None = None) -> None:
         not config.TELEGRAM_BOT_TOKEN or not config.allowed_ids
     ):
         raise ValueError("Telegram requires a token and allowed user IDs")
+    if mode == "whatsapp" and (
+        not config.WHATSAPP_ACCESS_TOKEN
+        or not config.WHATSAPP_PHONE_NUMBER_ID
+        or not config.allowed_whatsapp_numbers
+    ):
+        raise ValueError("WhatsApp requires access token, phone number ID, and allowed numbers")
     if mode == "web" and not config.WEB_AUTH_TOKEN:
         raise ValueError("WEB_AUTH_TOKEN is required")
     if mode == "routines" and not config.ROUTINES_CONFIG:
@@ -69,6 +75,8 @@ async def async_main(args: list[str] | None = None) -> None:
     memory = SqliteMemory(config.MEMORY_PATH)
 
     # Wire Core Agent
+    from yusufclaw.agent import Agent
+
     agent = Agent(
         provider=provider,
         memory=memory,
@@ -81,6 +89,7 @@ async def async_main(args: list[str] | None = None) -> None:
         cli={config.CLI_USER_ID},
         telegram=set(config.allowed_ids),
         web={config.WEB_USER_ID},
+        whatsapp=set(config.allowed_whatsapp_numbers),
     )
 
     shutdown_event = asyncio.Event()
@@ -133,6 +142,26 @@ async def async_main(args: list[str] | None = None) -> None:
                 token=config.TELEGRAM_BOT_TOKEN,
             )
             await telegram_adapter.run(signal=shutdown_event)
+        elif mode == "whatsapp":
+            assert config.WHATSAPP_ACCESS_TOKEN is not None
+            assert config.WHATSAPP_PHONE_NUMBER_ID is not None
+            from yusufclaw.gateway.whatsapp import WhatsAppAdapter, WhatsAppApi
+
+            wa_api = WhatsAppApi(
+                access_token=config.WHATSAPP_ACCESS_TOKEN,
+                phone_number_id=config.WHATSAPP_PHONE_NUMBER_ID,
+            )
+            _wa_adapter = WhatsAppAdapter(
+                bus=bus,
+                api=wa_api,
+                allowed_numbers=set(config.allowed_whatsapp_numbers),
+                verify_token=config.WHATSAPP_VERIFY_TOKEN or "",
+                app_secret=config.WHATSAPP_APP_SECRET or "",
+            )
+            _ = _wa_adapter
+            sys.stdout.write("WhatsApp adapter initialized and waiting for webhook events.\n")
+            sys.stdout.flush()
+            await shutdown_event.wait()
         elif mode == "routines":
             # Routines are scheduled with skills later
             sys.stdout.write("Routines runner will be loaded with skills subsystem.\n")

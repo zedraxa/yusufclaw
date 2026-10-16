@@ -26,6 +26,7 @@ from yusufclaw.gateway.approval import (
     format_telegram_card_message,
 )
 from yusufclaw.gateway.bus import IncomingMessage, MessageBus
+from yusufclaw.voice.types import SpeechToText, TextToSpeech
 
 
 class TelegramFrom(BaseModel):
@@ -46,6 +47,18 @@ class TelegramChat(BaseModel):
     type: str
 
 
+class TelegramVoice(BaseModel):
+    """Voice note or audio attachment metadata in a Telegram message."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    file_id: str
+    file_unique_id: str | None = None
+    duration: int | None = None
+    mime_type: str | None = None
+    file_size: int | None = None
+
+
 class TelegramMessage(BaseModel):
     """Telegram message object."""
 
@@ -53,6 +66,8 @@ class TelegramMessage(BaseModel):
 
     message_id: int | None = None
     text: str | None = None
+    voice: TelegramVoice | None = None
+    audio: TelegramVoice | None = None
     from_: TelegramFrom | None = Field(default=None, alias="from")
     chat: TelegramChat
 
@@ -96,6 +111,10 @@ class TelegramTransport:
         """Call a Telegram API method with a JSON payload."""
         raise NotImplementedError
 
+    async def download_file(self, file_path: str, signal: Any = None) -> bytes:
+        """Download binary file from Telegram Bot API."""
+        raise NotImplementedError
+
 
 class TelegramApi(TelegramTransport):
     """Concrete Telegram API client with token URL masking and error handling."""
@@ -109,6 +128,32 @@ class TelegramApi(TelegramTransport):
         self.token = token
         self.fetcher = fetcher
         self.timeout = timeout
+
+    async def download_file(self, file_path: str, signal: Any = None) -> bytes:
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        if self.fetcher is not None:
+            try:
+                res = self.fetcher(url, method="GET")
+                if inspect.isawaitable(res):
+                    res = await res
+                if hasattr(res, "content"):
+                    return res.content  # type: ignore[no-any-return]
+                if isinstance(res, bytes):
+                    return res
+                return b""
+            except Exception as exc:
+                raise RuntimeError("Telegram network request failed") from exc
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url)
+        except Exception as exc:
+            raise RuntimeError("Telegram network request failed") from exc
+
+        if not response.is_success:
+            raise TelegramApiError(response.status_code)
+
+        return response.content
 
     async def call(
         self, method: str, body: dict[str, Any], signal: Any = None
@@ -203,12 +248,18 @@ class TelegramAdapter:
         token: str = "",
         wait: Callable[[int, Any], Awaitable[None]] | None = None,
         approval_provider: ApprovalProvider | None = None,
+        stt: SpeechToText | None = None,
+        tts: TextToSpeech | None = None,
+        reply_as_voice: bool = False,
         *,
         bot_token: str | None = None,
         allowed_users: list[str] | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.allowed_users = allowed_users or []
+        self.stt = stt
+        self.tts = tts
+        self.reply_as_voice = reply_as_voice
 
         if bus is None or api is None or allowed is None:
             # Placeholder initialization mode for backward compatibility
@@ -426,11 +477,40 @@ class TelegramAdapter:
             return
 
         msg = upd.message
-        if not msg or not msg.text or not msg.from_ or msg.from_.is_bot:
+        if not msg or not msg.from_ or msg.from_.is_bot:
             return
         if msg.chat.type != "private":
             return
         if str(msg.from_.id) not in self.allowed:
+            return
+
+        text_content = msg.text
+        is_voice_message = False
+        voice_obj = msg.voice or msg.audio
+
+        if text_content is None and voice_obj is not None:
+            if self.stt is None:
+                return
+            is_voice_message = True
+            file_info = await self.api.call(
+                "getFile", {"file_id": voice_obj.file_id}, signal=signal
+            )
+            file_path: str | None = None
+            if isinstance(file_info, dict):
+                file_path = file_info.get("file_path")
+            elif hasattr(file_info, "file_path"):
+                file_path = file_info.file_path
+
+            if not file_path:
+                return
+
+            audio_bytes = await self.api.download_file(file_path, signal=signal)
+            transcription = await self.stt.transcribe(
+                audio_bytes, mime_type=voice_obj.mime_type
+            )
+            text_content = transcription.text
+
+        if not text_content:
             return
 
         async def approve_callback(call: Any, card: Any = None) -> bool:
@@ -499,7 +579,7 @@ class TelegramAdapter:
                     userId=str(msg.from_.id),
                     conversationId=str(msg.chat.id),
                     requestId=str(upd.update_id),
-                    text=msg.text,
+                    text=text_content,
                 ),
                 approve=approve_callback,
                 signal=signal,
@@ -511,6 +591,22 @@ class TelegramAdapter:
                 "Request failed. Check provider configuration and connectivity, "
                 "then send your message again."
             )
+
+        if (self.reply_as_voice or is_voice_message) and self.tts is not None:
+            try:
+                audio_res = await self.tts.synthesize(reply)
+                await self.api.call(
+                    "sendVoice",
+                    {
+                        "chat_id": msg.chat.id,
+                        "caption": reply[:1024] if len(reply) <= 1024 else reply[:1020] + "...",
+                        "voice_bytes": audio_res.audio_bytes,
+                    },
+                    signal=signal,
+                )
+                return
+            except Exception:
+                pass
 
         for chunk in split_telegram_text(reply):
             await self.api.call(
@@ -589,5 +685,6 @@ __all__ = [
     "TelegramMessage",
     "TelegramTransport",
     "TelegramUpdate",
+    "TelegramVoice",
     "split_telegram_text",
 ]

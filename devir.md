@@ -980,4 +980,15 @@ cdk deploy --all --require-approval never --profile yusufclaw
 cd infra_py && cdk destroy --all --force --profile yusufclaw
 # DynamoDB tablosu ve S3 bucket RETAIN politikasındadır; gerekirse elle silin.
 ```
-||||||| a9c30f8
+---
+
+## 27. Python Çok Kanallı İletişim ve Ses Katmanı (WhatsApp & Agnostic Voice) — `py-channels` Dalı
+
+- Yeni `src/yusufclaw/gateway/whatsapp.py` adaptörü: Meta WhatsApp Business Cloud API entegrasyonu; `hub.mode`, `hub.verify_token`, `hub.challenge` GET doğrulama el sıkışması, `X-Hub-Signature-256` HMAC-SHA256 imza denetimi, telefon numarası normalizasyonu ve sahip izin listesi (`WHATSAPP_ALLOWED_NUMBERS`). Yetkisiz göndericiler MessageBus ve ajana ulaşmadan erken aşamada reddedilir.
+- YC-05 Onay Paritesi: Eylem kartları (`ActionCard`) WhatsApp etkileşimli yanıt düğmeleri (`interactive reply buttons`: `approve:<id>:<nonce>`, `deny:<id>:<nonce>`, `details:<id>:<nonce>`) olarak iletilir. Nonce eşleşmesi, argüman tahrifatı koruması, 300 saniye zaman aşımı ve replay saldırı engellemesi Telegram ile birebir aynı `ApprovalProvider` sözleşmesiyle korunur.
+- Yeni `src/yusufclaw/voice/` paketi: Sağlayıcıdan bağımsız `SpeechToText` ve `TextToSpeech` protokolleri (`types.py`), deterministik testler için `FakeSTT` ve `FakeTTS` (`fake.py`), bulut OpenAI Whisper/TTS (`openai_voice.py`), yerel iş parçacıklı `faster-whisper` (`whisper_voice.py`) ve AWS Transcribe/Polly (`aws_voice.py`) sağlayıcıları ile `get_stt_provider` / `get_tts_provider` fabrikası.
+- Telegram Ses Entegrasyonu (`src/yusufclaw/gateway/telegram.py`): Sesli mesajlar (`TelegramVoice`) Bot API üzerinden indirilip STT protokolü ile metne deşifre edilir ve MessageBus'a iletilir; yanıtlar opsiyonel olarak TTS sentezi ile sesli mesaj (`sendVoice`) olarak döndürülebilir.
+- Kanal Kayıt ve Yapılandırma Kancası (`src/yusufclaw/gateway/channels.py`): `ChannelRegistry` ve `setup_channels` ile kanallar ve ses katmanı Pydantic ayarları üzerinden bağlanır. Gerekli kimlik bilgisi veya izin listesi olmayan kanallar kesin olarak kapalı kalır.
+- Doğrulama: `uv run pytest -q && uv run ruff check . && uv run mypy src` → **350 passed, 1 skipped, 1 xfailed**; ruff temiz; strict mypy temiz (109 kaynak dosyasında 0 hata). Çevrimdışı test süitleri `tests/python/test_whatsapp_gateway.py`, `tests/python/test_voice.py`, `tests/python/test_channels_wiring.py` (26 yeni test) canlı ağ veya AWS gerektirmez. Kullanım ve kılavuz: `docs/PY-CHANNELS.md`. `gateway/web.py`, `gateway/web_page.py`, `gateway/approval.py` iç mantığı, `a2a/`, `writers/`, `memory/`, `sandbox/`, `evals/`, queue store ve roller değiştirilmedi. AWS kullanılmadı; push yapılmadı. Birleştirmede §27 olarak numaralandı; mevcut bölümler yeniden numaralandırılmadı.
+
+

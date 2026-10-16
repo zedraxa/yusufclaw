@@ -74,6 +74,28 @@ class Settings(BaseSettings):
         description="Comma-separated allowlist of Telegram numeric user IDs.",
     )
 
+    # WhatsApp Gateway
+    whatsapp_enabled: bool = Field(default=False, description="Enable WhatsApp Business Cloud API adapter.")
+    whatsapp_access_token: str | None = Field(default=None, description="WhatsApp Cloud API access token.")
+    whatsapp_phone_number_id: str | None = Field(default=None, description="WhatsApp Business phone number ID.")
+    whatsapp_app_secret: str | None = Field(default=None, description="Meta App Secret for HMAC verification.")
+    whatsapp_verify_token: str | None = Field(default=None, description="Meta webhook verify token.")
+    whatsapp_allowed_numbers: str = Field(
+        default="",
+        description="Comma-separated allowlist of WhatsApp phone numbers (E.164).",
+    )
+
+    # Voice Subsystem
+    voice_enabled: bool = Field(default=False, description="Enable speech transcription and voice synthesis.")
+    voice_stt_provider: str = Field(default="fake", description="STT provider (fake, openai, whisper, amazon).")
+    voice_tts_provider: str = Field(default="fake", description="TTS provider (fake, openai, amazon).")
+    voice_reply_as_audio: bool = Field(default=False, description="Return replies as voice/audio messages.")
+    openai_stt_model: str = Field(default="whisper-1", description="OpenAI transcription model.")
+    openai_tts_model: str = Field(default="tts-1", description="OpenAI speech synthesis model.")
+    openai_tts_voice: str = Field(default="alloy", description="OpenAI speech voice.")
+    whisper_model_size: str = Field(default="base", description="faster-whisper model size.")
+    polly_voice_id: str = Field(default="Joanna", description="Amazon Polly voice ID.")
+
     # Skills & Routines
     skills_dir: str = Field(default="skills", description="Directory containing local markdown skills.")
     routines_config: str | None = Field(default=None, description="Optional JSON path for scheduled routines.")
@@ -91,6 +113,19 @@ class Settings(BaseSettings):
         if not self.telegram_allowed_user_ids:
             return []
         return [uid.strip() for uid in self.telegram_allowed_user_ids.split(",") if uid.strip()]
+
+    @property
+    def allowed_whatsapp_numbers_list(self) -> list[str]:
+        """Parse comma-separated WhatsApp allowlist into trimmed normalized numbers."""
+        import re
+
+        if not self.whatsapp_allowed_numbers:
+            return []
+        return [
+            re.sub(r"\D", "", num)
+            for num in self.whatsapp_allowed_numbers.split(",")
+            if re.sub(r"\D", "", num)
+        ]
 
 
 @lru_cache(maxsize=1)

@@ -24,6 +24,7 @@ from yusufclaw.gateway.bus import (
     MessageBus,
     UnauthorizedUserError,
 )
+from yusufclaw.gateway.channels import ChannelRegistry, setup_channels
 from yusufclaw.gateway.cli import cli_app, run_cli
 from yusufclaw.gateway.config import GatewayConfig, load_config, loadConfig
 from yusufclaw.gateway.main import async_main, main
@@ -37,6 +38,7 @@ from yusufclaw.gateway.telegram import (
     TelegramMessage,
     TelegramTransport,
     TelegramUpdate,
+    TelegramVoice,
     split_telegram_text,
 )
 from yusufclaw.gateway.web import (
@@ -60,6 +62,13 @@ from yusufclaw.gateway.web_page import (
     chatScript,
     chatStyle,
 )
+from yusufclaw.gateway.whatsapp import (
+    WhatsAppAdapter,
+    WhatsAppApi,
+    create_whatsapp_router,
+    normalize_phone_number,
+    split_whatsapp_text,
+)
 
 __all__ = [
     "CHAT_PAGE",
@@ -70,6 +79,7 @@ __all__ = [
     "ApprovalProvider",
     "ApprovalRecord",
     "ApprovalResult",
+    "ChannelRegistry",
     "ChannelType",
     "ChatMessageInput",
     "GatewayConfig",
@@ -89,7 +99,10 @@ __all__ = [
     "TelegramMessage",
     "TelegramTransport",
     "TelegramUpdate",
+    "TelegramVoice",
     "UnauthorizedUserError",
+    "WhatsAppAdapter",
+    "WhatsAppApi",
     "WebAdapter",
     "WebAdapterOptions",
     "app",
@@ -100,11 +113,15 @@ __all__ = [
     "chatStyle",
     "cli_app",
     "create_app",
+    "create_whatsapp_router",
     "format_sse_event",
     "format_telegram_card_message",
     "loadConfig",
     "load_config",
     "main",
+    "normalize_phone_number",
     "run_cli",
+    "setup_channels",
     "split_telegram_text",
+    "split_whatsapp_text",
 ]

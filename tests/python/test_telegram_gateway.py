@@ -46,6 +46,7 @@ class FakeAgent:
 class MockTelegramApi(TelegramTransport):
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.files: dict[str, bytes] = {}
 
     async def call(
         self, method: str, body: dict[str, Any], signal: Any = None
@@ -53,7 +54,13 @@ class MockTelegramApi(TelegramTransport):
         self.calls.append((method, body))
         if method == "getUpdates":
             return []
+        if method == "getFile":
+            file_id = body.get("file_id", "")
+            return {"file_id": file_id, "file_path": f"voice/{file_id}.oga"}
         return {"ok": True, "result": {}}
+
+    async def download_file(self, file_path: str, signal: Any = None) -> bytes:
+        return self.files.get(file_path, b"FAKE_DOWNLOADED_AUDIO_BYTES")
 
 
 class FakeApprovalProvider:
@@ -465,3 +472,72 @@ async def test_telegram_callback_queries_with_replay_and_tampering_protection(
     )
     last_call4 = api.calls[-1]
     assert "Etkiler: exec" in last_call4[1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_note_transcription_and_reply(memory_db: SqliteMemory) -> None:
+    """TelegramAdapter downloads voice note, transcribes via STT, and returns synthesized audio."""
+    from yusufclaw.voice import FakeSTT, FakeTTS
+
+    agent = FakeAgent(reply="Processed voice command")
+    bus = MessageBus(agent, telegram={"123"})
+    api = MockTelegramApi()
+    api.files["voice/voice_file_abc.oga"] = b"OGG_TELEGRAM_AUDIO_BYTES"
+
+    stt = FakeSTT(default_text="Create git commit")
+    tts = FakeTTS(dummy_audio=b"SYNTHESIZED_REPLY_OGG")
+
+    adapter = TelegramAdapter(
+        bus=bus,
+        memory=memory_db,
+        api=api,
+        allowed={"123"},
+        token="token-xyz",
+        stt=stt,
+        tts=tts,
+        reply_as_voice=True,
+    )
+
+    # 1. Incoming voice note
+    voice_update = {
+        "update_id": 300,
+        "message": {
+            "message_id": 10,
+            "from": {"id": 123, "is_bot": False},
+            "chat": {"id": 123, "type": "private"},
+            "voice": {
+                "file_id": "voice_file_abc",
+                "mime_type": "audio/ogg",
+                "duration": 3,
+            },
+        },
+    }
+
+    await adapter.handle(voice_update)
+
+    # STT called
+    assert len(stt.recorded_calls) == 1
+    assert stt.recorded_calls[0]["mime_type"] == "audio/ogg"
+
+    # Agent called with transcribed text
+    assert len(agent.recorded_messages) == 1
+    assert agent.recorded_messages[0]["text"] == "Create git commit"
+
+    # Reply sent as voice
+    last_call = api.calls[-1]
+    assert last_call[0] == "sendVoice"
+    assert last_call[1]["voice_bytes"] == b"SYNTHESIZED_REPLY_OGG"
+    assert "Processed voice command" in last_call[1]["caption"]
+
+    # 2. Voice note without STT configured is ignored
+    adapter_no_stt = TelegramAdapter(
+        bus=bus,
+        memory=memory_db,
+        api=api,
+        allowed={"123"},
+        token="token-xyz",
+        stt=None,
+    )
+    agent.recorded_messages.clear()
+    await adapter_no_stt.handle(voice_update)
+    assert len(agent.recorded_messages) == 0

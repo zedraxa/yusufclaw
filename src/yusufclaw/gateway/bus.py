@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-ChannelType = Literal["cli", "telegram", "web"]
+ChannelType = Literal["cli", "telegram", "web", "whatsapp"]
 
 
 class UnauthorizedUserError(PermissionError):
@@ -56,6 +56,7 @@ class MessageBus:
         cli: set[str] | None = None,
         telegram: set[str] | None = None,
         web: set[str] | None = None,
+        whatsapp: set[str] | None = None,
     ) -> None:
         self.agent = agent
         self.allowed: dict[str, set[str]] = {}
@@ -68,6 +69,8 @@ class MessageBus:
             self.allowed["telegram"] = set(telegram)
         if web is not None:
             self.allowed["web"] = set(web)
+        if whatsapp is not None:
+            self.allowed["whatsapp"] = set(whatsapp)
 
     async def dispatch(
         self,
