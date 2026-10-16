@@ -13,6 +13,7 @@ Implements the YusufClaw adaptive orchestration lifecycle:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -22,6 +23,7 @@ from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ToolDef
 from yusufclaw.orchestration.budget import BudgetManager
 from yusufclaw.orchestration.models import (
     AcceptanceCriteria,
+    ExecutionPlan,
     OrchestrationConfig,
     TaskAnalysis,
 )
@@ -29,6 +31,7 @@ from yusufclaw.orchestration.planner import PlanAndExecuteWorkflow
 from yusufclaw.orchestration.subagent import SubagentRunner
 from yusufclaw.orchestration.task_analyzer import TaskAnalyzer
 from yusufclaw.orchestration.verifier import Verifier
+from yusufclaw.queue import Job, Worker, default_queue, queue_enabled
 from yusufclaw.security import Grants
 from yusufclaw.telemetry import get_tracer
 
@@ -49,7 +52,9 @@ class AdaptiveOrchestrator:
         grants: Grants | None = None,
         router: ModelRouter | None = None,
         providers: Mapping[str, ModelProvider] | None = None,
+        user_id: str = "local",
     ) -> None:
+        self.user_id = user_id
         self.config = config or OrchestrationConfig(enabled=True)
         self.tools = list(tools) if tools else []
         self.grants = grants
@@ -100,6 +105,7 @@ class AdaptiveOrchestrator:
             parent_grants=self.grants,
             budget_manager=self.budget_manager,
             use_deep_agents=self.config.use_deep_agents_if_available,
+            user_id=self.user_id,
             router=self.router,
         )
         self.planner = PlanAndExecuteWorkflow(
@@ -110,6 +116,61 @@ class AdaptiveOrchestrator:
             available_tools=self.tools,
             router=self.router,
         )
+
+    async def handle_job(self, job: Job) -> dict[str, str]:
+        """Restartable orchestration handler using this instance's trusted provider/grants."""
+        if job.user_id != self.user_id:
+            raise ValueError("Worker principal mismatch")
+        store = default_queue()
+        await store.initialize()
+        previous_store = self.subagent_runner.job_queue
+        previous_parent = self.subagent_runner.parent_job_id
+        self.subagent_runner.job_queue = store
+        self.subagent_runner.parent_job_id = job.id
+        try:
+            output = await self.planner.execute(
+                job.payload["prompt"],
+                initial_plan=ExecutionPlan.model_validate(job.payload["plan"]),
+            )
+            return {"output": output}
+        finally:
+            self.subagent_runner.job_queue = previous_store
+            self.subagent_runner.parent_job_id = previous_parent
+            await store.close()
+
+    async def _execute_plan(self, prompt: str, plan: ExecutionPlan) -> str:
+        if not queue_enabled():
+            return await self.planner.execute(prompt, initial_plan=plan)
+        store = default_queue()
+        root: Job | None = None
+        try:
+            await store.initialize()
+            root = await store.enqueue(
+                "orchestration",
+                {"prompt": prompt, "plan": plan.model_dump()},
+                user_id=self.user_id,
+                role="orchestrator",
+                max_attempts=1,
+                concurrency_key="orchestration",
+                timeout=self.config.budget_limits.max_time_seconds_per_turn,
+            )
+
+            worker = Worker(store, {"orchestration": self.handle_job})
+            while True:
+                await worker.run_once(root.id)
+                current = await store.get(root.id)
+                if current.state == "succeeded":
+                    return str((current.result or {}).get("output", ""))
+                if current.state in {"failed", "cancelled"}:
+                    await store.cancel(root.id)
+                    return "Delegated execution stopped: " + (current.error or current.state)
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            if root is not None:
+                await store.cancel(root.id)
+            raise
+        finally:
+            await store.close()
 
     async def orchestrate_turn(
         self,
@@ -144,7 +205,7 @@ class AdaptiveOrchestrator:
             candidate_output = ""
             if analysis.strategy in ("plan_and_execute", "delegate"):
                 initial_plan = self.planner._build_plan_from_analysis(prompt, analysis)
-                candidate_output = await self.planner.execute(prompt, initial_plan=initial_plan)
+                candidate_output = await self._execute_plan(prompt, initial_plan)
             else:
                 # Direct agent execution loop
                 # Prefer cheap provider for simple and low-risk tasks when configured

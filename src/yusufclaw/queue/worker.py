@@ -11,6 +11,7 @@ from typing import Any
 
 import redis.asyncio as redis
 from opentelemetry import trace
+from opentelemetry.propagate import extract
 
 from yusufclaw.queue.store import Job, JobQueue, LeaseLost
 
@@ -23,6 +24,14 @@ def queue_enabled() -> bool:
 
 def default_queue() -> JobQueue:
     return JobQueue(os.environ.get("YUSUFCLAW_QUEUE_URL", "sqlite+aiosqlite:///queue.sqlite"))
+
+
+class JobFailed(Exception):
+    """Structured handler failure retained for the submitting caller."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        self.result = result
+        super().__init__("Handler failed")
 
 
 class WaitingApproval(Exception):
@@ -49,7 +58,7 @@ class RedisWakeup:
             await asyncio.sleep(min(timeout, 0.1))
 
     async def close(self) -> None:
-        await self.client.close()
+        await self.client.aclose()  # type: ignore[attr-defined]
 
 
 class Worker:
@@ -86,7 +95,7 @@ class Worker:
                 await self.queue.heartbeat(job.id, token, self.lease)
 
         with trace.get_tracer("yusufclaw.queue").start_as_current_span(
-            "yusufclaw.queue.execute"
+            "yusufclaw.queue.execute", context=extract(job.trace_context)
         ) as span:
             span.set_attributes(
                 {
@@ -108,8 +117,14 @@ class Worker:
                     raise TimeoutError("Job timed out")
                 result = await task
                 await self.queue.finish(job.id, token, result=result)
+            except JobFailed as exc:
+                with suppress(LeaseLost):
+                    await self.queue.finish(
+                        job.id, token, result=exc.result, error="handler_failed"
+                    )
             except WaitingApproval:
-                await self.queue.finish(job.id, token, waiting_approval=True)
+                with suppress(LeaseLost):
+                    await self.queue.finish(job.id, token, waiting_approval=True)
             except LeaseLost:
                 pass
             except asyncio.CancelledError:

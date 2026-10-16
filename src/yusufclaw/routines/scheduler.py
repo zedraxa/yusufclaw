@@ -8,8 +8,9 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from yusufclaw.queue import Job, JobQueue, Worker, default_queue, queue_enabled
 from yusufclaw.routines.cron import parse_cron
-from yusufclaw.routines.models import Routine, RoutineMessage
+from yusufclaw.routines.models import Routine, RoutineMessage, RoutineTarget
 from yusufclaw.routines.runner import (
     ChannelRunner,
     ChannelRunnerOptions,
@@ -28,7 +29,8 @@ async def get_memory_state(memory: Any, key: str) -> str | None:
         return None
     res = fn(key)
     if inspect.iscoroutine(res):
-        return str(await res) if (await res) is not None else None
+        value = await res
+        return str(value) if value is not None else None
     return str(res) if res is not None else None
 
 
@@ -55,7 +57,11 @@ class RoutineScheduler:
         transport: RoutineTransport | RoutineRunner | Any,
         on_error: Callable[[], None] | None = None,
         queue: SingleFlightQueue | None = None,
+        job_queue: JobQueue | None = None,
+        durable: bool | None = None,
     ) -> None:
+        self.durable = queue_enabled() if durable is None else durable
+        self.job_queue = job_queue
         self.routines = list(routines)
         self.memory = memory
         self.transport = transport
@@ -115,6 +121,32 @@ class RoutineScheduler:
                 text=routine.prompt,
             )
 
+            if self.durable:
+                store = self.job_queue or default_queue()
+                try:
+                    await store.initialize()
+                    await store.enqueue(
+                        "routine",
+                        {
+                            "routine_id": routine.id,
+                            "cron": routine.cron,
+                            "prompt": routine.prompt,
+                            "target": routine.target.to_dict(),
+                            "request_id": request_id,
+                            "minute": minute,
+                            "key": key,
+                        },
+                        user_id=routine.target.user_id,
+                        role="scheduler",
+                        idempotency_key=f"{key}:{minute}",
+                        run_at=minute * 60,
+                        concurrency_key=key,
+                    )
+                finally:
+                    if self.job_queue is None:
+                        await store.close()
+                continue
+
             # Queue-backed single-flight execution
             async def _run_job(
                 r: Routine = routine,
@@ -127,6 +159,32 @@ class RoutineScheduler:
 
             await self.queue.run_single_flight(routine.id, _run_job)
 
+    async def handle_job(self, job: Job) -> dict[str, Any]:
+        """Register with Worker; exceptions trigger durable retries."""
+        data = job.payload
+        target = data["target"]
+        routine = Routine(
+            id=data["routine_id"],
+            cron=data["cron"],
+            prompt=data["prompt"],
+            target=RoutineTarget(
+                channel=target["channel"],
+                user_id=target["userId"],
+                conversation_id=target["conversationId"],
+            ),
+        )
+        message = RoutineMessage(
+            channel=routine.target.channel,
+            user_id=job.user_id,
+            conversation_id=routine.target.conversation_id,
+            request_id=data["request_id"],
+            text=routine.prompt,
+        )
+        await self._run_single_routine(
+            routine, message, data["request_id"], data["minute"], data["key"], propagate=True
+        )
+        return {"delivered": True}
+
     async def _run_single_routine(
         self,
         routine: Routine,
@@ -135,6 +193,7 @@ class RoutineScheduler:
         minute: int,
         key: str,
         signal: Any = None,
+        propagate: bool = False,
     ) -> None:
         try:
             check_aborted(signal)
@@ -175,18 +234,30 @@ class RoutineScheduler:
         except Exception:
             check_aborted(signal)
             self.on_error()
+            if propagate:
+                raise
 
     async def run(self, signal: Any = None) -> None:
         """Run the continuous schedule loop until cancelled or signal aborted."""
-        while not is_aborted(signal):
-            try:
+        store = self.job_queue or default_queue() if self.durable else None
+        worker_task: asyncio.Task[None] | None = None
+        if store is not None:
+            await store.initialize()
+            worker_task = asyncio.create_task(Worker(store, {"routine": self.handle_job}).run())
+        try:
+            while not is_aborted(signal):
+                if worker_task is not None and worker_task.done():
+                    await worker_task
                 await self.tick(datetime.now(UTC), signal)
                 await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                if not is_aborted(signal):
-                    raise RuntimeError("Routine scheduler failed") from exc
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if worker_task is not None:
+                worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
+            if store is not None and self.job_queue is None:
+                await store.close()
 
 
 def create_routine_scheduler(

@@ -14,6 +14,7 @@ Implements bounded subagent workers following the architecture principles:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Sequence
@@ -33,6 +34,8 @@ from yusufclaw.models.types import (
 )
 from yusufclaw.orchestration.budget import BudgetManager
 from yusufclaw.orchestration.models import SubagentResult, SubagentSpec
+from yusufclaw.queue import Job, JobQueue, Worker, default_queue, queue_enabled
+from yusufclaw.queue.worker import JobFailed
 from yusufclaw.security import Grants
 from yusufclaw.telemetry import get_tracer
 
@@ -66,7 +69,15 @@ class SubagentRunner:
         budget_manager: BudgetManager | None = None,
         use_deep_agents: bool = True,
         router: ModelRouter | None = None,
+        job_queue: JobQueue | None = None,
+        durable: bool | None = None,
+        user_id: str = "local",
+        parent_job_id: str | None = None,
     ) -> None:
+        self.job_queue = job_queue
+        self.durable = queue_enabled() if durable is None else durable
+        self.user_id = user_id
+        self.parent_job_id = parent_job_id
         self.provider = provider
         self.router = router
         self.parent_tools = list(parent_tools) if parent_tools else []
@@ -90,7 +101,77 @@ class SubagentRunner:
                 allowed.append(self.parent_tools_map[name])
         return allowed
 
+    async def handle_job(self, job: Job) -> dict[str, Any]:
+        if job.user_id != self.user_id:
+            raise ValueError("Worker principal mismatch")
+        result = await self._run_inline(SubagentSpec.model_validate(job.payload["spec"]))
+        if not result.success:
+            raise JobFailed(result.model_dump())
+        return result.model_dump()
+
     async def run(
+        self,
+        spec: SubagentSpec,
+        budget_manager: BudgetManager | None = None,
+    ) -> SubagentResult:
+        spec.max_depth = min(spec.max_depth, 1)
+        if not self.durable:
+            return await self._run_inline(spec, budget_manager)
+        store = self.job_queue or default_queue()
+        job: Job | None = None
+        try:
+            await store.initialize()
+            bounded_spec = spec.model_copy(
+                update={
+                    "permitted_tools": [
+                        tool.name for tool in self._filter_permitted_tools(spec.permitted_tools)
+                    ]
+                }
+            )
+            job = await store.enqueue(
+                "subagent",
+                {"spec": bounded_spec.model_dump()},
+                user_id=self.user_id,
+                role=spec.model_role,
+                parent_id=self.parent_job_id,
+                timeout=spec.timeout_seconds,
+                max_attempts=1,
+                budget=max(0, spec.max_tokens * spec.max_steps),
+            )
+
+            async def handle(current: Job) -> dict[str, Any]:
+                result = await self._run_inline(
+                    SubagentSpec.model_validate(current.payload["spec"]), budget_manager
+                )
+                if not result.success:
+                    raise JobFailed(result.model_dump())
+                return result.model_dump()
+
+            worker = Worker(store, {"subagent": handle})
+            while True:
+                await worker.run_once(job.id)
+                current = await store.get(job.id)
+                if current.state == "succeeded":
+                    return SubagentResult.model_validate(current.result)
+                if current.state in {"failed", "cancelled"}:
+                    if current.result is not None:
+                        return SubagentResult.model_validate(current.result)
+                    return SubagentResult(
+                        subagent_name=spec.name,
+                        success=False,
+                        output="",
+                        error=current.error or current.state,
+                    )
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            if job is not None:
+                await store.cancel(job.id)
+            raise
+        finally:
+            if self.job_queue is None:
+                await store.close()
+
+    async def _run_inline(
         self,
         spec: SubagentSpec,
         budget_manager: BudgetManager | None = None,
@@ -205,8 +286,7 @@ class SubagentRunner:
                     bm.record_step(1)
 
                 lc_tcs: list[dict[str, Any]] = [
-                    {"name": tc.name, "args": tc.input, "id": tc.id}
-                    for tc in resp.tool_calls
+                    {"name": tc.name, "args": tc.input, "id": tc.id} for tc in resp.tool_calls
                 ]
                 ai_msg = AIMessage(content=resp.text, tool_calls=lc_tcs)
                 curr_steps = state.get("step_count", 0)
@@ -307,7 +387,9 @@ class SubagentRunner:
                 span.set_attribute("yusufclaw.subagent.steps_used", result.steps_used)
                 if self.router is not None:
                     _, p_name, _ = self.router.route(spec.model_role or ModelRole.DEFAULT)
-                    span.set_attribute("yusufclaw.routing.role", spec.model_role or ModelRole.DEFAULT.value)
+                    span.set_attribute(
+                        "yusufclaw.routing.role", spec.model_role or ModelRole.DEFAULT.value
+                    )
                     span.set_attribute("yusufclaw.routing.provider", p_name)
 
             return result

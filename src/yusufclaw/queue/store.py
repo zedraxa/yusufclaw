@@ -5,10 +5,11 @@ from __future__ import annotations
 import builtins
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal
 
+from opentelemetry.propagate import inject
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     JSON,
@@ -60,6 +61,7 @@ events = Table(
 class Job(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     kind: str
+    trace_context: dict[str, str] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
     user_id: str = "local"
     role: str = "default"
@@ -99,11 +101,13 @@ class JobQueue:
         url: str = "sqlite+aiosqlite:///queue.sqlite",
         *,
         clock: Callable[[], float] = time.time,
+        notify: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+psycopg://", 1)
         self.engine = create_async_engine(url)
         self.clock = clock
+        self.notify = notify
 
     async def initialize(self) -> None:
         async with self.engine.begin() as conn:
@@ -154,6 +158,7 @@ class JobQueue:
         self, kind: str, payload: dict[str, Any] | None = None, **options: Any
     ) -> Job:
         job = Job(kind=kind, payload=payload or {}, **options)
+        inject(job.trace_context)
         if job.state != "queued" or job.attempts or job.charged:
             raise ValueError("New jobs must be unstarted")
         async with self.transaction() as conn:
@@ -184,6 +189,9 @@ class JobQueue:
                 )
             )
             await self._save(conn, job, "queued")
+        if self.notify:
+            with suppress(Exception):
+                await self.notify()
         return job
 
     async def set_limit(self, scope: Literal["user", "role"], identity: str, limit: Limit) -> None:
@@ -251,6 +259,17 @@ class JobQueue:
                     j.error = "lease_expired"
                     self._retry(j)
                     await self._save(conn, j, "reclaimed")
+            changed = True
+            while changed:
+                changed = False
+                failed_parents = {j.id for j in all_jobs if j.state in {"failed", "cancelled"}}
+                for child in all_jobs:
+                    if child.parent_id in failed_parents and child.state not in TERMINAL:
+                        child.state = "cancelled"
+                        child.lease_token = None
+                        child.lease_until = 0
+                        await self._save(conn, child, "cancelled")
+                        changed = True
             query = (
                 select(jobs.c.data)
                 .where(jobs.c.state == "queued", jobs.c.run_at <= self.clock())
