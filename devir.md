@@ -906,3 +906,12 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - Doğrulama: `uv run pytest -q` → **228 passed, 1 skipped**; `uv run ruff check .` → temiz; `uv run mypy src` → **82 dosyada hata yok**.
 - Kullanım ve sınırlar: `docs/PY-MEMCONS.md`. İş kapsam başına tek yazıcıyla, en fazla 200 aktif kayıt üzerinde çalışır; otomatik zamanlama/agent entegrasyonu eklenmedi. Agent, models, gateway, roles, coordination ve queue değiştirilmedi. AWS kullanılmadı; push yapılmadı. §20 queue worker için ayrılmıştır; mevcut bölümler yeniden numaralandırılmadı.
 
+
+---
+
+## 22. Python Çevrimdışı Değerlendirme Koşucusu — `py-evals` Dalı
+
+- `evals/offline.py` ve `evals/offline_fixtures.json`: ajan çekirdeğini scripted/mock `ModelProvider` ile çevrimdışı çalıştırır (ağ, API anahtarı, AWS yok). Senaryolar: sayfa/araç çıktısı enjeksiyonu (sızdırma / onaysız tehlikeli araç), zararsız bellek/araç/rutin başarıları, görev başına onay kartı sayısı.
+- Bilinen güvenlik boşlukları `expected_fail` / xfail ile yeşil koşucu korunur; ASR raporda tutulur. CI alt kümesi `tests/python/test_evals.py` içinde DNS/socket/subprocess yasaklıdır.
+- Rapor: `evals/results/` JSON+markdown (`latest.*` gitignore; `sample.*` örnek). Mevcut YAML `evals/runner.py` güvenlik paketi ayrı tutuldu.
+- Doğrulama: `uv run pytest -q` → **257 passed, 1 skipped, 1 xfailed**; ruff temiz; mypy src temiz. Kullanım: `docs/PY-EVALS.md`. Agent/models/gateway/roles/queue/memory/sandbox değiştirilmedi. AWS yok; push yapılmadı.
