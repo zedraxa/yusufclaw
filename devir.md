@@ -743,3 +743,84 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - Dokümantasyon bütünlüğü kontrol edildi.
 - Test çalıştırma veya kod değişikliği yapılmadı.
 
+---
+
+## 17. (ayrılmış) Streaming tool-call / trace düzeltmesi — `py-streamfix` Dalı
+
+- Bu bölüm `yusufclaw-agy-streamfix` çalışması tamamlandığında doldurulacak; streaming yolunda tool call düşürme ve `trace_model_call` atlama hatasının düzeltmesi.
+
+---
+
+## 18. Uzman Ajan Rol Kataloğu, Açık Yetenek Matrisleri ve Politika Yürütümü — `py-roles` Dalı
+
+### 18.1 Genel Mimari ve Kararlar
+- **Tasarım İlkesi**: Tek ve genel amaçlı devasa bir model yerine, `docs/ARCHITECTURE-v2.md` Katman 2 (Meta-orchestrator) ve Katman 3 (Subagents: least-privilege tools, read-only by default, sandbox execution) prensiplerine uygun, yetenek sınırları kesin olarak çizilmiş uzman ajan rol kataloğu (`CapabilityMatrix`) oluşturulmuştur.
+- **Kapsam ve En Az Yetki (Least Privilege)**:
+  - 8 uzman rol tanımlanmıştır: `orchestrator`, `coder`, `writer`, `mail`, `browser`, `researcher`, `ops`, `scheduler`.
+  - Her uzman rol için:
+    - İzin verilen araçlar (`allowed_tools`) ve MCP sunucuları (`allowed_mcp_servers`).
+    - Beceriler (`skills`).
+    - Model katmanı (`model_tier`: `strong`, `cheap`, `local`).
+    - Bellek okuma/yazma sınırları (`memory_scopes`: `read`, `write`).
+    - Risk seviyesi (`risk_level`: `low`, `medium`, `high`, `critical`).
+    - İnsan onayı gerektiren eylemler (`approval_actions`).
+    - Bütçe tavanları (`budget_limits`: token, maliyet, adım ve süre limitleri).
+    - Rootless sandbox izolasyon zorunluluğu (`sandbox_required`, `sandbox_mode`).
+    - Dış iletişim kanalları (`send_channels`) ve **`send = always approval` kuralı**: Bir rolün dış dünyaya (Telegram, Web, Email vb.) mesaj göndermesi her koşulda insan onayı gerektiren bir `ActionCard` üretir; izinsiz kanal gönderimleri fail-closed olarak reddedilir.
+    - A2A 1.0 (Agent-to-Agent) ajan keşif kartı alanları (`A2AAgentCard`).
+- **Mimari İzolasyon**: `memory/`, `security/`, `skills/`, `routines/`, `telemetry/`, `models/`, `infra_py/` ve `packages/` (TypeScript) modüllerine dokunulmamış; rol mimarisi bağımsız ve tam uyumlu olarak `src/yusufclaw/roles/` altında inşa edilmiştir.
+
+### 18.2 Gerçekleştirilen Bileşenler
+1. **Pydantic Yetenek Matrisi Şeması (`src/yusufclaw/roles/models.py`)**:
+   - `CapabilityMatrix`: Rol kimliği (`role_id`), görünen isim, açıklama, takma adlar (`aliases`), araç/MCP izin listeleri, beceriler, model katmanı, bellek sınırları, risk seviyesi, onay gerektiren eylemler, bütçe sınırları, sandbox gereksinimi, kanal izinleri ve A2A kartı.
+   - `MemoryScopeConfig`: `can_read(scope)` ve `can_write(scope)` yöntemleriyle joker karakter (`*`) veya tam kapsam eşleşmesi desteği.
+   - `A2AAgentCard`: A2A 1.0 protokolü ile tam uyumlu; yetenekler, girdi/çıktı modları, beceriler ve semantik sürümleme içerir.
+   - `RoleRoutingDecision`: Görev çözümleme sonucunda seçilen birincil rol, ikincil roller, güven puanı ve gerekçelendirme.
+2. **8 Uzman Rolün YAML Katalog Tanımları (`roles/catalog/` ve `src/yusufclaw/roles/catalog/`)**:
+   - `orchestrator.yaml`: Grok Bot tarzı ana asistan; planlama, alt ajan delegasyonu, rutin otomasyonu ve bellek koordinasyonu yapar (`model_tier: strong`, `risk_level: medium`).
+   - `coder.yaml`: Codex tarzı sandboxed yazılım mühendisliği uzmanı; repo düzenleme, test yürütme, git işlemleri (`sandbox_required: true`, `risk_level: high`, `git_push` onay kapılı).
+   - `writer.yaml`: Dokümantasyon, rapor ve e-posta taslağı uzmanı; taslak hazırlar ama asla doğrudan dışarı mesaj göndermez (`send_channels: []`, `risk_level: low`).
+   - `mail.yaml`: Gelen kutusu okuma, önceliklendirme ve taslak yanıt uzmanı; e-posta gönderimi kesin olarak insan onayına bağlıdır (`send_channels: [email]`, `approval_actions: [mail_send]`).
+   - `browser.yaml` (alias: `web`): Web gezintisi, form doldurma ve araştırma uzmanı; form gönderimleri ve satın alma/ödeme işlemleri insan onayına bağlıdır (`sandbox_required: true`, `risk_level: medium`).
+   - `researcher.yaml`: Akademik ve bilimsel literatür derin araştırma uzmanı; arXiv, Semantic Scholar taraması ve kanıt/atıf doğrulaması yapar (`model_tier: strong`, `risk_level: low`).
+   - `ops.yaml` (alias: `devops`): Bulut altyapısı ve DevOps uzmanı; varsayılan olarak yalnızca doğrulama (validate-only) modunda çalışır; canlı dağıtım ve kaynak silme kesin olarak insan onayına bağlıdır (`risk_level: critical`).
+   - `scheduler.yaml`: Takvim, hatırlatıcı ve ajanda uzmanı; toplantı ve hatırlatıcıları yönetir (`model_tier: cheap`, `risk_level: low`).
+3. **Katalog Yükleyicisi ve Doğrulayıcı (`src/yusufclaw/roles/loader.py`)**:
+   - `RoleCatalog`: YAML dosyalarını otomatik tespit eder, şema doğrulamasından geçirir, mükerrer rol kimliklerini denetler, takma ad haritasını (`alias_map`) kurar.
+   - `get_role(name_or_alias)`: Büyük/küçük harf duyarsız ve takma ad destekli rol erişimi (`web` -> `browser`, `devops` -> `ops`).
+   - `validate_catalog()`: Tüm rollerin güvenlik kurallarını ve sandbox tutarlılığını doğrular.
+4. **Görev Çözümleyicili Rol Yönlendiricisi (`src/yusufclaw/roles/router.py`)**:
+   - `RoleRouter`: `TaskAnalyzer` sınıfından gelen karmaşıklık, risk, gerekli araçlar ve alt görev çözümlemelerini etki alanı örüntüleriyle birleştirir.
+   - Tekil görevlerde doğrudan en uygun uzman role (`coder`, `writer`, `mail`, `browser`, `researcher`, `ops`, `scheduler`) yönlendirir.
+   - Çok adımlı delegasyon görevlerinde `orchestrator` rolünü birincil yönetici, ilgili uzmanları ise ikincil alt ajanlar olarak tayin eder.
+5. **Politika Yürütüm Motoru (`src/yusufclaw/roles/enforcement.py`)**:
+   - `RolePolicyEnforcer`: Güvenlik katmanında her araç çağrısını deterministik olarak denetler:
+     - Yetkisiz araç çağrıları: Fail-closed olarak reddedilir (`PolicyDecision(kind='deny')`).
+     - Yetkisiz MCP sunucuları: Reddedilir.
+     - Bellek kapsam ihlalleri: Yetkisiz okuma veya yazma denemeleri engellenir.
+     - Dış kanal gönderimleri: Yetkisiz kanallar engellenir; izinli kanallarda **`send = always approval`** kuralı işletilerek `ActionCard` üretilir.
+     - Onay kapılı eylemler: Doğrudan insan onayına sunulur.
+     - Geçerli çağrılar: Monotonik Progent/FIDES temel güvenlik denetimlerine (`decide`) delege edilir.
+6. **Web Ağ Geçidi ve AG-UI Durum Entegrasyonu (`src/yusufclaw/gateway/web.py`)**:
+   - `GET /api/roles`: Yetkili kullanıcılara tüm uzman rolleri, yetenek matrislerini ve A2A kartlarını JSON formatında sunar.
+   - `GET /api/events`: AG-UI SSE akışına ilk bağlantıda `roles` olayını basarak ön yüzün aktif rolleri tanımasını sağlar.
+7. **Yetenek Matrisi Dokümantasyon Üreticisi (`src/yusufclaw/roles/generator.py`)**:
+   - `docs/CAPABILITY-MATRIX.md`: 8 rolün tüm yeteneklerini karşılaştıran detaylı markdown tablosu, rol profilleri ve A2A JSON kartlarını otomatik oluşturur.
+
+### 18.3 Test ve Doğrulama
+- **Eklenen Test Dosyası (`tests/python/test_roles.py`)**:
+  - 19 yeni birim ve entegrasyon testi:
+    - Şema doğrulama, bellek kapsamı normalizasyonu ve A2A kart sentezi testleri.
+    - Katalog 8 rol tam yükleme, takma ad ve bozuk YAML hata yönetimi testleri.
+    - 8 etki alanında görev yönlendirme ve çok adımlı delegasyon orkestrasyonu testleri.
+    - Politika yürütüm motorunda izin verilen/reddedilen araçlar, MCP sunucuları ve bellek sınırları testleri.
+    - Harici kanal gönderimi reddi ve `send = always approval` eylem kartı testleri.
+    - Yüksek riskli onay kapılı eylem testleri (`git_push`, `infra_deploy`, `browser_submit`).
+    - Web ağ geçidi `/api/roles` uç noktası (401 yetkisiz ve 200 yetkili durumlar) ve `/api/events` SSE akışı testleri.
+    - `docs/CAPABILITY-MATRIX.md` dokümantasyon üretici doğrulama testi.
+- **Sonuçlar**:
+  - `uv run pytest`: **158 passed, 1 skipped** (26.33s, 22 test dosyasında 159 test, 0 hata).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 74 kaynak dosyasında tam strict modda 0 hata (`Success: no issues found in 74 source files`).
+- **Kılavuz Belgesi**: `docs/CAPABILITY-MATRIX.md`.
+
