@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -23,6 +23,7 @@ from yusufclaw.models.types import (
     ModelProvider,
     ModelRequest,
     ModelResponse,
+    StreamChunk,
 )
 from yusufclaw.telemetry.instrumentation import record_routing_decision
 
@@ -245,6 +246,12 @@ class ModelRouter(ModelProvider):
             raise KeyError(f"Resolved provider name '{provider_name}' has no active instance.")
 
         role_str = role.value if isinstance(role, ModelRole) else str(role)
+        try:
+            object.__setattr__(provider, "_routing_provider", provider_name)
+            object.__setattr__(provider, "_routing_role", role_str)
+            object.__setattr__(provider, "_routing_reason", reason)
+        except Exception:
+            pass
         record_routing_decision(
             role=role_str,
             provider_name=provider_name,
@@ -265,6 +272,23 @@ class ModelRouter(ModelProvider):
         """Execute completion turn delegating to default routed provider."""
         provider = self.get_provider(ModelRole.DEFAULT)
         return await provider.complete(request)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        """Execute streaming turn delegating to default routed provider."""
+        provider = self.get_provider(ModelRole.DEFAULT)
+        stream_fn = getattr(provider, "stream", None)
+        if callable(stream_fn):
+            async for chunk in stream_fn(request):
+                yield chunk
+        else:
+            resp = await provider.complete(request)
+            if resp.text:
+                yield StreamChunk(text=resp.text)
+            if resp.tool_calls:
+                yield StreamChunk(tool_calls=resp.tool_calls)
+            if resp.usage:
+                yield StreamChunk(usage=resp.usage)
+            yield StreamChunk(response=resp)
 
 
 __all__ = [

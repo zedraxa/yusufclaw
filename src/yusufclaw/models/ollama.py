@@ -1,11 +1,21 @@
 """Ollama model provider implementation using httpx."""
 
+import json
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
-from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ModelResponse, ToolCall
+from yusufclaw.models.types import (
+    Message,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    StreamAccumulator,
+    StreamChunk,
+    ToolCall,
+)
 
 
 class OllamaProvider(ModelProvider):
@@ -105,3 +115,69 @@ class OllamaProvider(ModelProvider):
             tool_calls=tool_calls,
             usage=usage,
         )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        """Stream chat completion from Ollama HTTP API."""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._format_messages(request.system, request.messages),
+            "stream": True,
+        }
+
+        if request.tools:
+            payload["tools"] = self._format_tools(request.tools)
+
+        options: dict[str, Any] = {}
+        if request.max_tokens is not None:
+            options["num_predict"] = request.max_tokens
+        if request.temperature is not None:
+            options["temperature"] = request.temperature
+        if options:
+            payload["options"] = options
+
+        accumulator = StreamAccumulator()
+
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    data = json.loads(line_str)
+                    message = data.get("message", {})
+                    content = message.get("content", "")
+                    if content:
+                        item = StreamChunk(text=content)
+                        accumulator.add(item)
+                        yield item
+
+                    raw_tool_calls = message.get("tool_calls", [])
+                    if raw_tool_calls:
+                        tool_calls: list[ToolCall] = []
+                        for tc in raw_tool_calls:
+                            fn = tc.get("function", {})
+                            call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                            tool_calls.append(
+                                ToolCall(
+                                    id=call_id,
+                                    name=fn.get("name", ""),
+                                    input=fn.get("arguments", {}),
+                                )
+                            )
+                        item = StreamChunk(tool_calls=tool_calls)
+                        accumulator.add(item)
+                        yield item
+
+                    if data.get("done"):
+                        usage = {
+                            "prompt_tokens": data.get("prompt_eval_count", 0),
+                            "completion_tokens": data.get("eval_count", 0),
+                        }
+                        item = StreamChunk(usage=usage)
+                        accumulator.add(item)
+                        yield item
+
+        final_response = accumulator.finalize()
+        yield StreamChunk(response=final_response)
+

@@ -1,10 +1,20 @@
 """AWS Bedrock model provider implementation using boto3 Converse API."""
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import boto3
 
-from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ModelResponse, ToolCall
+from yusufclaw.models.types import (
+    Message,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    StreamAccumulator,
+    StreamChunk,
+    ToolCall,
+    ToolCallDelta,
+)
 
 
 class BedrockProvider(ModelProvider):
@@ -141,3 +151,78 @@ class BedrockProvider(ModelProvider):
             tool_calls=tool_calls,
             usage=usage_dict,
         )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        """Stream chat completion from AWS Bedrock ConverseStream API."""
+        if not self.model_id:
+            raise ValueError("bedrock_model_id is required for BedrockProvider")
+
+        client = self._get_client()
+
+        params: dict[str, Any] = {
+            "modelId": self.model_id,
+            "messages": self._format_messages(request.messages),
+            "inferenceConfig": {"maxTokens": request.max_tokens or self.max_tokens},
+        }
+
+        if request.system:
+            params["system"] = [{"text": request.system}]
+
+        if request.tools:
+            params["toolConfig"] = {"tools": self._format_tools(request.tools)}
+
+        response = client.converse_stream(**params)
+        stream = response.get("stream", [])
+        accumulator = StreamAccumulator()
+
+        current_block_index = 0
+        for event in stream:
+            if "contentBlockStart" in event:
+                start = event["contentBlockStart"].get("start", {})
+                current_block_index = event["contentBlockStart"].get(
+                    "contentBlockIndex", current_block_index
+                )
+                if "toolUse" in start:
+                    tu = start["toolUse"]
+                    delta = ToolCallDelta(
+                        index=current_block_index,
+                        id=tu.get("toolUseId"),
+                        name=tu.get("name"),
+                    )
+                    item = StreamChunk(tool_call_delta=delta)
+                    accumulator.add(item)
+                    yield item
+
+            elif "contentBlockDelta" in event:
+                current_block_index = event["contentBlockDelta"].get(
+                    "contentBlockIndex", current_block_index
+                )
+                d = event["contentBlockDelta"].get("delta", {})
+                if "text" in d:
+                    item = StreamChunk(text=d["text"])
+                    accumulator.add(item)
+                    yield item
+                elif "toolUse" in d:
+                    tu_delta = d["toolUse"]
+                    delta = ToolCallDelta(
+                        index=current_block_index,
+                        args_delta=tu_delta.get("input", ""),
+                    )
+                    item = StreamChunk(tool_call_delta=delta)
+                    accumulator.add(item)
+                    yield item
+
+            elif "metadata" in event:
+                usage = event["metadata"].get("usage", {})
+                if usage:
+                    u = {
+                        "prompt_tokens": usage.get("inputTokens", 0),
+                        "completion_tokens": usage.get("outputTokens", 0),
+                    }
+                    item = StreamChunk(usage=u)
+                    accumulator.add(item)
+                    yield item
+
+        final_response = accumulator.finalize()
+        yield StreamChunk(response=final_response)
+

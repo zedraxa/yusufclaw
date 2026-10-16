@@ -11,7 +11,7 @@ from collections.abc import Mapping
 
 from yusufclaw.config import Settings, get_settings
 from yusufclaw.models.bedrock import BedrockProvider
-from yusufclaw.models.fake import FakeProvider
+from yusufclaw.models.fake import FakeProvider, FakeStreamingProvider
 from yusufclaw.models.ollama import OllamaProvider
 from yusufclaw.models.openai import OpenAIProvider
 from yusufclaw.models.router import ModelRole, ModelRouter, RoutingConfig
@@ -21,7 +21,10 @@ from yusufclaw.models.types import (
     ModelRequest,
     ModelResponse,
     Role,
+    StreamAccumulator,
+    StreamChunk,
     ToolCall,
+    ToolCallDelta,
     ToolDefinition,
 )
 
@@ -111,6 +114,7 @@ def get_model_router(
 __all__ = [
     "BedrockProvider",
     "FakeProvider",
+    "FakeStreamingProvider",
     "Message",
     "ModelProvider",
     "ModelRequest",
@@ -121,7 +125,10 @@ __all__ = [
     "OpenAIProvider",
     "Role",
     "RoutingConfig",
+    "StreamAccumulator",
+    "StreamChunk",
     "ToolCall",
+    "ToolCallDelta",
     "ToolDefinition",
     "get_model_provider",
     "get_model_router",

@@ -1,11 +1,21 @@
 """OpenAI-compatible model provider implementation."""
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from openai import AsyncOpenAI
 
-from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ModelResponse, ToolCall
+from yusufclaw.models.types import (
+    Message,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    StreamAccumulator,
+    StreamChunk,
+    ToolCall,
+    ToolCallDelta,
+)
 
 
 class OpenAIProvider(ModelProvider):
@@ -117,3 +127,71 @@ class OpenAIProvider(ModelProvider):
             tool_calls=tool_calls,
             usage=usage_dict,
         )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamChunk]:
+        """Send chat completion streaming request to OpenAI API."""
+        client = self._build_client()
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._format_messages(request.system, request.messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        if request.tools:
+            kwargs["tools"] = self._format_tools(request.tools)
+        if request.max_tokens is not None:
+            kwargs["max_tokens"] = request.max_tokens
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+
+        completion_stream = await client.chat.completions.create(**kwargs)
+        accumulator = StreamAccumulator()
+
+        async for chunk in completion_stream:
+            if not chunk.choices:
+                if chunk.usage:
+                    u = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                    }
+                    chunk_item = StreamChunk(usage=u)
+                    accumulator.add(chunk_item)
+                    yield chunk_item
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if delta.content:
+                chunk_item = StreamChunk(text=delta.content)
+                accumulator.add(chunk_item)
+                yield chunk_item
+
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    fn = tc.function
+                    name = fn.name if fn else None
+                    args = fn.arguments if fn else None
+                    tc_delta = ToolCallDelta(
+                        index=tc.index,
+                        id=tc.id,
+                        name=name,
+                        args_delta=args,
+                    )
+                    chunk_item = StreamChunk(tool_call_delta=tc_delta)
+                    accumulator.add(chunk_item)
+                    yield chunk_item
+
+            if chunk.usage:
+                u = {
+                    "prompt_tokens": chunk.usage.prompt_tokens,
+                    "completion_tokens": chunk.usage.completion_tokens,
+                }
+                chunk_item = StreamChunk(usage=u)
+                accumulator.add(chunk_item)
+                yield chunk_item
+
+        final_response = accumulator.finalize()
+        yield StreamChunk(response=final_response)
+
