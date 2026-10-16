@@ -60,7 +60,8 @@ export class Agent {
           signal?.throwIfAborted();
           if (!entry) throw new Error('Unknown tool');
           if (!entry.validate(call.input)) throw new Error('Invalid tool arguments');
-          if (entry.tool.requiresApproval && !(await approve?.(call))) throw new Error('Tool approval denied');
+          const needsApproval = typeof entry.tool.requiresApproval === 'function' ? entry.tool.requiresApproval(call.input) : Boolean(entry.tool.requiresApproval);
+          if (needsApproval && !(await approve?.(call))) throw new Error('Tool approval denied');
           signal?.throwIfAborted();
           result = await entry.tool.execute(call.input, signal);
         } catch (cause) {

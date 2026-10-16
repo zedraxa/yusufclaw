@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Agent, SqliteMemory } from '@yusufclaw/core';
 import { BedrockProvider, OllamaProvider } from '@yusufclaw/models';
-import { currentTime } from '@yusufclaw/tools';
+import { createDefaultTools } from '@yusufclaw/tools';
 import { MessageBus } from './bus.js';
 import { loadConfig } from './config.js';
 import { runCli } from './cli.js';
@@ -20,7 +20,7 @@ async function main() {
     ? new BedrockProvider({ model: config.BEDROCK_MODEL_ID!, region: config.AWS_REGION, profile: config.AWS_PROFILE, maxTokens: config.MAX_TOKENS, timeoutMs: config.MODEL_TIMEOUT_MS })
     : new OllamaProvider({ model: config.OLLAMA_MODEL, baseUrl: config.OLLAMA_BASE_URL, maxTokens: config.MAX_TOKENS, timeoutMs: config.MODEL_TIMEOUT_MS });
   const memory = new SqliteMemory(config.MEMORY_PATH);
-  const agent = new Agent(provider, memory, [currentTime], { maxSteps: config.MAX_AGENT_STEPS, historyTurns: config.HISTORY_TURNS });
+  const agent = new Agent(provider, memory, createDefaultTools(), { maxSteps: config.MAX_AGENT_STEPS, historyTurns: config.HISTORY_TURNS });
   const bus = new MessageBus(agent, { cli: new Set([config.CLI_USER_ID]), telegram: new Set(config.allowedIds) });
   const controller = new AbortController();
   const stop = () => controller.abort();
