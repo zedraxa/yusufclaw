@@ -13,9 +13,24 @@ Implements durable structured memory systems:
 - Context assembly with bounded limits and evidence IDs for LLM prompt context.
 """
 
+from yusufclaw.memory.compaction import (
+    CompactionOptions,
+    CompactionResult,
+    ContextCompactor,
+    DeterministicSummarizer,
+    LLMSummarizer,
+    Summarizer,
+)
+from yusufclaw.memory.consolidation import (
+    ConsolidationJob,
+    ConsolidationOptions,
+    ConsolidationResult,
+)
 from yusufclaw.memory.context import (
     ActiveSessionContext,
     active_session_context,
+    memory_score,
+    rank_memories,
     session_scope,
 )
 from yusufclaw.memory.fts import sanitize_fts5_query, sanitize_tsquery
@@ -35,9 +50,22 @@ from yusufclaw.memory.models import (
 )
 from yusufclaw.memory.postgres import PostgresMemory
 from yusufclaw.memory.sqlite import SqliteMemory, generate_memory_id
+from yusufclaw.memory.store import MemoryStore
 from yusufclaw.memory.tools import MemoryTool, create_memory_tools
 
 __all__ = [
+    "CompactionOptions",
+    "CompactionResult",
+    "ContextCompactor",
+    "DeterministicSummarizer",
+    "LLMSummarizer",
+    "Summarizer",
+    "ConsolidationJob",
+    "ConsolidationOptions",
+    "ConsolidationResult",
+    "MemoryStore",
+    "memory_score",
+    "rank_memories",
     "ActiveSessionContext",
     "ContextAssemblyOptions",
     "EmbeddingProvider",

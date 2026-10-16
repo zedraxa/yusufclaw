@@ -222,6 +222,10 @@ class ContextAssemblyOptions(BaseModel):
         serialization_alias="maxSearchEntries",
     )
 
+    decay_half_life_days: float = Field(default=90, gt=0)
+    pinned_ids: set[str] = Field(default_factory=set)
+    importance: dict[str, float] = Field(default_factory=dict)
+
     model_config = ConfigDict(populate_by_name=True)
 
     @property

@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from yusufclaw.memory.context import rank_memories
 from yusufclaw.memory.fts import sanitize_fts5_query
 from yusufclaw.memory.models import (
     ContextAssemblyOptions,
@@ -667,20 +668,27 @@ class SqliteMemory:
             else ContextAssemblyOptions.model_validate(options or {})
         )
 
+        if opts.max_entries <= 0 or opts.max_chars <= 0:
+            return ""
+
         max_entries = opts.max_entries
         max_chars = opts.max_chars
         max_profile_entries = opts.max_profile_entries
         max_search_entries = opts.max_search_entries
 
-        profile_records = self.get_profile(scope, max_profile_entries)
+        profile_records = rank_memories(
+            self.get_profile(scope, max(20, max_profile_entries)), opts
+        )[:max(0, max_profile_entries)]
         seen_ids = {r.id for r in profile_records}
 
         search_records: builtins.list[MemoryRecord] = []
         if query and query.strip():
             raw_search = self.search(
-                scope, query.strip(), SearchOptions(limit=max_search_entries)
+                scope, query.strip(), SearchOptions(limit=max(20, max_search_entries))
             )
-            search_records = [r for r in raw_search if r.id not in seen_ids]
+            search_records = rank_memories(
+                [r for r in raw_search if r.id not in seen_ids], opts
+            )[:max(0, max_search_entries)]
 
         total_count = len(profile_records) + len(search_records)
         if total_count == 0:
@@ -714,7 +722,7 @@ class SqliteMemory:
 
         result = "\n".join(lines)
         if len(result) > max_chars:
-            result = result[: max_chars - 3] + "..."
+            result = (result[: max_chars - 3] + "...") if max_chars >= 3 else result[:max_chars]
         return result
 
     def assembleContext(
