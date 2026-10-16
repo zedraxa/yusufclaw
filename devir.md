@@ -745,9 +745,45 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 
 ---
 
-## 17. (ayrılmış) Streaming tool-call / trace düzeltmesi — `py-streamfix` Dalı
+## 17. Python Model Streaming Onarımı ve Dağıtık İzleme Entegrasyonu (`py-streamfix` Dalı)
 
-- Bu bölüm `yusufclaw-agy-streamfix` çalışması tamamlandığında doldurulacak; streaming yolunda tool call düşürme ve `trace_model_call` atlama hatasının düzeltmesi.
+### 17.1 Problem Tanımı ve Kök Neden Analizi
+- **Sorun 1 (Kayıp Araç Çağrıları)**: `py-agui` dalında eklenen model akış (streaming) kod yolunda, model yanıtı yalnızca ham metin parçalarından (`ModelResponse(text="".join(accumulated_text))`) tekrar oluşturuluyordu. Modelin akış sırasında ürettiği `tool_calls` bilgisi düşüyor, `AIMessage` nesnesine araç çağrıları aktarılamadığı için LangGraph ajan döngüsü `tool_node` adımına geçemeden `END` durumuna yönleniyordu.
+- **Sorun 2 (Eksik OTel Dağıtık İzleme)**: `trace_model_call` sarmalayıcısı yalnızca `else` (non-streaming) bloğunda çalıştırıldığı için, akış yapan modellerde OpenTelemetry span'ları (`yusufclaw.model.complete`), token metrikleri ve model yönlendirme öznitelikleri (`yusufclaw.routing.provider`, `yusufclaw.routing.role`, `gen_ai.request.model`) tamamen atlanıyordu.
+
+### 17.2 Gerçekleştirilen Mimari Çözümler
+1. **Sağlayıcı Akış Arayüzü ve Veri Modelleri (`src/yusufclaw/models/types.py`)**:
+   - `ToolCallDelta`: Artımlı araç çağrısı parçaları (`index`, `id`, `name`, `args_delta`, `input`).
+   - `StreamChunk`: Normalleştirilmiş akış nesnesi (`text`, `tool_call_delta`, `tool_calls`, `usage`, `response`).
+   - `StreamAccumulator`: Akıştan gelen metin parçacıklarını, parça parça biriken JSON araç çağrılarını ve kullanım bilgilerini asenkron olarak toplayıp tek bir nihai `ModelResponse` nesnesine dönüştüren güvenli toplayıcı.
+   - `ModelProvider.stream(request)`: Sağlayıcılar için standart asenkron üreteç protokolü.
+2. **Ajan Döngüsü Model Düğümü Onarımı (`src/yusufclaw/agent.py`)**:
+   - `trace_model_call(active_p, request)` sarmalayıcısı hem akış hem de tek parça model çağrılarını kapsayacak şekilde kök düzeye çekildi.
+   - Akış sırasında `text_delta` (AG-UI token akışı), `tool_call_delta` ve `tool_call` turn kancaları gerçek zamanlı olarak tetiklenirken, arka planda `StreamAccumulator` ile tam yanıt inşa edildi.
+   - Akış tamamlandığında `record_model_response` ile token ve süre metrikleri span'a eksiksiz işlendi.
+   - `stream` implemente etmeyen veya `NotImplementedError` fırlatan sağlayıcılar için tek seferlik `complete()` çağrısına zarif geri düşüş (`graceful fallback`) korundu.
+3. **Sağlayıcı Adaptörleri Güncellemesi (`src/yusufclaw/models/`)**:
+   - `FakeProvider` & `FakeStreamingProvider`: Testler ve offline ortamlar için deterministik akış simülatörü.
+   - `OpenAIProvider.stream`: OpenAI Chat Completions streaming ve araç çağrı parçacığı ayrıştırması.
+   - `OllamaProvider.stream`: Yerel Ollama `/api/chat` SSE JSON satır akışı ve araç çağrısı yakalama.
+   - `BedrockProvider.stream`: AWS Bedrock `converse_stream` API blok ve araç kullanım olayları eşleyicisi.
+   - `ModelRouter.stream`: Yönlendirilen sağlayıcıya akış delegasyonu.
+4. **Dağıtık İzleme ve Yönlendirme Semantikleri (`src/yusufclaw/telemetry/instrumentation.py`)**:
+   - `_resolve_model_metadata` ve `trace_model_call`: `ModelRouter` veya yönlendirilmiş sağlayıcı örneği üzerindeki `yusufclaw.routing.provider`, `yusufclaw.routing.role` ve `gen_ai.request.model` niteliklerinin akış span'larına da eksiksiz yazılması sağlandı.
+
+### 17.3 Test ve Doğrulama
+- **Eklenen Testler (`tests/python/test_streaming.py`)**:
+  - `test_streaming_provider_emits_text_and_tool_call_in_order`: Metin ve araç çağrısı üreten akış sağlayıcısının aracı çalıştırması, AG-UI olaylarının kronolojik sırası (`text_delta` -> `tool_call_start` -> `tool_call_end` -> `text_delta`) ve OTel span kaydı.
+  - `test_streaming_with_tool_call_deltas`: Parçalı JSON argümanlarının birleşimi ve araç yürütümü.
+  - `test_streaming_with_routed_provider_attributes_on_span`: Model yönlendirme özniteliklerinin akış span'larında doğrulanması.
+  - `test_streaming_fallback_when_not_implemented`: `NotImplementedError` durumunda geriye dönük uyumluluk kontrolü.
+  - `test_stream_accumulator_direct`: Birim düzeyinde toplayıcı doğrulaması.
+  - `test_openai_provider_stream_mocked`, `test_ollama_provider_stream_mocked`, `test_bedrock_provider_stream_mocked`: Mock sağlayıcı akış testleri.
+- **Sonuçlar**:
+  - `uv run pytest`: **174 passed, 1 skipped** (baseline 166 + 8 yeni streaming testi, %100 yeşil).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 0 hata, 69 kaynak dosyasında tam strict tip denetimi.
+  - İzolasyon güvencesi: `roles/`, `src/yusufclaw/roles/` ve `gateway/web.py` dosyalarına dokunulmadı.
 
 ---
 
@@ -823,4 +859,3 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
   - `uv run mypy src`: 74 kaynak dosyasında tam strict modda 0 hata (`Success: no issues found in 74 source files`).
 - **Kılavuz Belgesi**: `docs/CAPABILITY-MATRIX.md`.
-
