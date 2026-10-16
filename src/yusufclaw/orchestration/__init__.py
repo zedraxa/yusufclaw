@@ -35,6 +35,7 @@ from yusufclaw.orchestration.orchestrator import AdaptiveOrchestrator
 from yusufclaw.orchestration.planner import PlanAndExecuteWorkflow
 from yusufclaw.orchestration.subagent import DEEP_AGENTS_AVAILABLE, SubagentRunner
 from yusufclaw.orchestration.task_analyzer import TaskAnalyzer
+from yusufclaw.orchestration.verifier import Verifier
 
 __all__ = [
     "DEEP_AGENTS_AVAILABLE",
