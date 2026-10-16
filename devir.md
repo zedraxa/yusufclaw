@@ -352,3 +352,52 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - **Mypy**: 0 hata (`uv run mypy src` -> `Success: no issues found in 41 source files`).
 - **Dokunulmayan Alanlar**: `src/yusufclaw/gateway`, `security`, `tools`, `memory` ve `packages/` %100 temiz ve dokunulmamıştır.
 - **Kılavuz Belgesi**: `PY-SKILLS.md`.
+
+---
+
+## 10. Python OpenTelemetry Dağıtık İzleme ve Metrik Alt Sistemi — `py-otel` Dalı
+
+### 10.1 Genel Mimari ve Kararlar
+- `docs/ARCHITECTURE-v2.md` Katman 8 ("Verification & governance: verifier with acceptance criteria, rootless-container sandbox, permissions, approvals, reversible action log, OpenTelemetry tracing (tokens, latency, errors per agent)") ve P1 OTel yol haritası hedefleri eksiksiz olarak `src/yusufclaw/telemetry/` altında uygulanmıştır.
+- **Kapsam İzolasyonu**: `src/yusufclaw/gateway`, `security`, `tools`, `memory`, `skills`, `routines` ve `packages/` (TypeScript) dizinlerine kesinlikle dokunulmamıştır. Yalnızca `src/yusufclaw/agent.py` içinde asenkron context manager sarmalayıcıları (`trace_agent_turn`, `trace_model_call`, `trace_tool_call`, `trace_approval_wait`) ile minimal çağrı noktaları bağlanmıştır.
+- **Offline & Sıfır Ağ Bağımlılığı**: Varsayılan kurulumda (`otlp_endpoint` boş olduğunda) hiçbir harici ağ/soket çağrısı yapılmaz; güvenli bellek içi/no-op davranışı korunur. Tüm birim ve entegrasyon testleri `InMemorySpanExporter` ve `InMemoryMetricReader` ile sıfır ağ bağlantısıyla deterministik olarak çalışır.
+
+### 10.2 Gerçekleştirilen Bileşenler
+1. **OpenTelemetry Sağlayıcı Yönetimi (`src/yusufclaw/telemetry/__init__.py`)**:
+   - `setup_telemetry(service_name, otlp_endpoint, span_exporter, metric_reader, force_reinit)`:
+     - `Resource.create({"service.name": service_name})`.
+     - `span_exporter` (örn. testlerde `InMemorySpanExporter`) verildiğinde `SimpleSpanProcessor` ile doğrudan bağlama.
+     - `otlp_endpoint` verildiğinde HTTP protobuff standardına (`/v1/traces`, `/v1/metrics`) otomatik normalize ederek `BatchSpanProcessor(OTLPSpanExporter)` ve `PeriodicExportingMetricReader(OTLPMetricExporter)` devreye alma.
+     - Uç nokta verilmediğinde sıfır dış bağımlılıklı offline `TracerProvider` ve `MeterProvider`.
+   - `reset_telemetry()`: Testler arasında durum izolasyonu sağlayan temizleme aracı.
+   - `get_tracer(name)` ve `get_meter(name)`: Etkin veya global sağlayıcıdan doğrudan örnek üreten erişimciler.
+2. **Semantik Standartlar ve Nitelikler (`src/yusufclaw/telemetry/attributes.py`)**:
+   - OpenTelemetry GenAI Semantic Conventions (`gen_ai.*`): `gen_ai.system`, `gen_ai.request.model`, `gen_ai.operation.name` ("chat"), `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens`, `gen_ai.usage.total_tokens`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`.
+   - YusufClaw Alan Nitelikleri: `yusufclaw.session_id`, `yusufclaw.request_id`, `yusufclaw.turn.step_count`, `yusufclaw.turn.status`, `yusufclaw.tool.name`, `yusufclaw.tool.call_id`, `yusufclaw.tool.status` ("success" | "error" | "policy_denied" | "approval_denied"), `yusufclaw.tool.is_guarded`, `yusufclaw.approval.id`, `yusufclaw.approval.tool_name`, `yusufclaw.approval.status`.
+   - Standart Span İsimleri: `yusufclaw.agent.turn`, `yusufclaw.model.complete`, `yusufclaw.tool.execute`, `yusufclaw.approval.wait`.
+3. **Metrik Enstrümanları ve Kayıt Defteri (`src/yusufclaw/telemetry/metrics.py`)**:
+   - `agent.turn.duration`: Histogram (`ms`), ajan turn yürütme süreleri.
+   - `agent.turns.total`: Counter (`1`), oturum ve duruma göre turn sayıları.
+   - `model.call.duration`: Histogram (`ms`), sağlayıcı tamamlama gecikmeleri.
+   - `model.tokens.total`: Counter (`1`), modele ve türe (`prompt`, `completion`, `total`) göre tüketilen token miktarı.
+   - `tool.execution.duration`: Histogram (`ms`), araç yürütme gecikmeleri.
+   - `tool.executions.total`: Counter (`1`), araca ve duruma göre çağrı adetleri.
+   - `approval.wait.duration`: Histogram (`ms`), insan onay bekleme gecikmeleri.
+   - `approval.requests.total`: Counter (`1`), onay istekleri ve kararları.
+4. **Asenkron İzleme Sarmalayıcıları (`src/yusufclaw/telemetry/instrumentation.py`)**:
+   - `trace_agent_turn`: Turn yaşam döngüsü, süre ölçümü, hata yakalama ve durum etiketleme.
+   - `trace_model_call` & `record_model_response`: Model çağrısı gecikmesi, token sayımı ve hata kaydı.
+   - `trace_tool_call`: Araç bazında yürütme süresi ve sonuç durumu (`ToolSpanContext`).
+   - `trace_approval_wait`: ActionCard insan onayı bekleme süresi ve onay/ret takibi (`ApprovalSpanContext`).
+5. **LangGraph Ajan Döngüsü Entegrasyonu (`src/yusufclaw/agent.py`)**:
+   - `Agent.run_state` ve `Agent.handle`: Turn başlangıcında kök `yusufclaw.agent.turn` span'ı açar; oturum ve istek kimliklerini ekler.
+   - `model_node`: `provider.complete` çağrısını `trace_model_call` ile izler ve `record_model_response` ile token kullanımını işler.
+   - `tool_node`: Deterministik güvenlik politikası retlerini (`policy_denied`), insan onayı bekleme süresini (`trace_approval_wait`), onay retlerini (`approval_denied`) ve araç yürütmelerini (`trace_tool_call`) iç içe hiyerarşik span'lar olarak bağlar.
+
+### 10.3 Test ve Doğrulama
+- **Pytest**: `tests/python/test_telemetry.py` (10 kapsamlı test senaryosu) eklendi; **104 testin tamamı** yeşil geçti (`uv run pytest`, 6.30s).
+- **Ruff**: 0 hata, tam uyum (`uv run ruff check .` -> `All checks passed!`).
+- **Mypy**: 0 hata, 49 kaynak dosyasında tam strict tip denetimi (`uv run mypy src` -> `Success: no issues found in 49 source files`).
+- **Dokunulmayan Alanlar**: `src/yusufclaw/gateway`, `security`, `tools`, `memory`, `skills`, `routines`, `packages/` ve AWS altyapısı %100 temiz ve dokunulmamıştır.
+- **Kılavuz Belgesi**: `PY-OTEL.md`.
+
