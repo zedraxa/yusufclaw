@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar, Token
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -25,6 +26,7 @@ from yusufclaw.models.types import (
     Message,
     ModelProvider,
     ModelRequest,
+    ModelResponse,
     ToolCall,
     ToolDefinition,
 )
@@ -51,6 +53,28 @@ from yusufclaw.tools.manifest import GuardedTool
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
 ApproveCallback = Callable[[ToolCall, ActionCard | None], Awaitable[bool]]
+TurnEventCallback = Callable[[str, dict[str, Any]], Any]
+
+_current_turn_hook: ContextVar[TurnEventCallback | None] = ContextVar(
+    "current_turn_hook", default=None
+)
+
+
+def set_turn_event_hook(
+    hook: TurnEventCallback | None,
+) -> Token[TurnEventCallback | None]:
+    """Set the turn event hook for the current async task context."""
+    return _current_turn_hook.set(hook)
+
+
+def reset_turn_event_hook(token: Token[TurnEventCallback | None]) -> None:
+    """Reset the turn event hook."""
+    _current_turn_hook.reset(token)
+
+
+def get_turn_event_hook() -> TurnEventCallback | None:
+    """Get the active turn event hook."""
+    return _current_turn_hook.get()
 
 
 class AgentState(TypedDict):
@@ -78,6 +102,7 @@ class Agent:
         skills: str | None = None,
         enable_orchestration: bool = False,
         orchestration_config: OrchestrationConfig | None = None,
+        turn_callback: TurnEventCallback | None = None,
     ) -> None:
         if isinstance(memory, str):
             system_prompt = memory
@@ -93,6 +118,7 @@ class Agent:
         self.grants = grants
         self.card_store = card_store or ActionCardStore()
         self.approve_callback = approve_callback
+        self.turn_callback = turn_callback
         self.taints: dict[str, SessionTaint] = {}
         self.enable_orchestration = enable_orchestration
 
@@ -197,9 +223,31 @@ class Agent:
                 messages=model_messages,
                 tools=self.tools,
             )
-            async with trace_model_call(self.provider, request) as model_span:
-                response = await self.provider.complete(request)
-                record_model_response(model_span, response, provider=self.provider)
+            hook = get_turn_event_hook() or self.turn_callback
+            stream_fn = getattr(self.provider, "stream", None)
+            if callable(stream_fn):
+                accumulated_text: list[str] = []
+                async for chunk in stream_fn(request):
+                    accumulated_text.append(chunk)
+                    if hook is not None:
+                        try:
+                            res = hook("text_delta", {"delta": chunk})
+                            if inspect.isawaitable(res):
+                                await res
+                        except Exception:
+                            pass
+                response = ModelResponse(text="".join(accumulated_text))
+            else:
+                async with trace_model_call(self.provider, request) as model_span:
+                    response = await self.provider.complete(request)
+                    record_model_response(model_span, response, provider=self.provider)
+                if hook is not None and response.text:
+                    try:
+                        res = hook("text_delta", {"text": response.text})
+                        if inspect.isawaitable(res):
+                            await res
+                    except Exception:
+                        pass
 
             lc_tool_calls: list[dict[str, Any]] = [
                 {
@@ -238,12 +286,26 @@ class Agent:
             results: list[ToolMessage] = []
             session_id = state.get("session_id", "default")
             taint = self.get_taint(session_id)
+            hook = get_turn_event_hook() or self.turn_callback
+
+            async def _emit_tool_event(ev_name: str, payload: dict[str, Any]) -> None:
+                if hook is not None:
+                    try:
+                        r = hook(ev_name, payload)
+                        if inspect.isawaitable(r):
+                            await r
+                    except Exception:
+                        pass
 
             for call in tool_calls:
                 call_id = call.get("id") or str(uuid.uuid4())
                 name = call.get("name", "")
                 args = call.get("args", {})
                 tool_def = self.tools_by_name.get(name)
+
+                await _emit_tool_event(
+                    "tool_call_start", {"id": call_id, "name": name, "args": args}
+                )
 
                 # Memory tools: execute directly (trusted, no egress)
                 if name in self._memory_tools_map:
@@ -256,6 +318,15 @@ class Agent:
                         except Exception as e:
                             output = f"Tool execution error: {e}"
                             tool_ctx.set_status("error")
+                    await _emit_tool_event(
+                        "tool_call_end",
+                        {
+                            "id": call_id,
+                            "name": name,
+                            "status": "success" if tool_ctx.status == "success" else "error",
+                            "result": output,
+                        },
+                    )
                     results.append(
                         ToolMessage(
                             content=output,
@@ -271,6 +342,15 @@ class Agent:
                         name=name, call_id=call_id, args=args, is_guarded=False
                     ) as tool_ctx:
                         tool_ctx.set_status("error")
+                    await _emit_tool_event(
+                        "tool_call_end",
+                        {
+                            "id": call_id,
+                            "name": name,
+                            "status": "error",
+                            "result": "Unknown tool",
+                        },
+                    )
                     results.append(
                         ToolMessage(
                             content="Unknown tool",
@@ -314,6 +394,15 @@ class Agent:
                         is_guarded=isinstance(tool_def, GuardedTool),
                     ) as tool_ctx:
                         tool_ctx.set_status("policy_denied")
+                    await _emit_tool_event(
+                        "tool_call_end",
+                        {
+                            "id": call_id,
+                            "name": name,
+                            "status": "policy_denied",
+                            "result": decision.reason,
+                        },
+                    )
                     results.append(
                         ToolMessage(
                             content=f"Tool policy denied: {decision.reason}",
@@ -338,6 +427,14 @@ class Agent:
                     if action_card is not None and self.card_store is not None:
                         self.card_store.register(action_card, expected_args=args)
 
+                    await _emit_tool_event(
+                        "approval_requested",
+                        {
+                            "card": action_card,
+                            "call": ToolCall(id=call_id, name=name, input=args),
+                        },
+                    )
+
                     approved = False
                     if self.approve_callback is not None:
                         async with trace_approval_wait(
@@ -360,6 +457,15 @@ class Agent:
                             is_guarded=isinstance(tool_def, GuardedTool),
                         ) as tool_ctx:
                             tool_ctx.set_status("approval_denied")
+                        await _emit_tool_event(
+                            "tool_call_end",
+                            {
+                                "id": call_id,
+                                "name": name,
+                                "status": "approval_denied",
+                                "result": "Tool approval denied",
+                            },
+                        )
                         results.append(
                             ToolMessage(
                                 content="Tool approval denied",
@@ -409,6 +515,15 @@ class Agent:
                         else:
                             output = f"Tool execution error: {err_msg}"
 
+                await _emit_tool_event(
+                    "tool_call_end",
+                    {
+                        "id": call_id,
+                        "name": name,
+                        "status": "success" if tool_ctx.status == "success" else "error",
+                        "result": output,
+                    },
+                )
                 results.append(
                     ToolMessage(
                         content=output,
@@ -433,43 +548,42 @@ class Agent:
         prompt: str,
         session_id: str = "default",
         approve_callback: ApproveCallback | None = None,
+        on_event: TurnEventCallback | None = None,
     ) -> str:
         """Run a single conversational turn and return the final assistant response."""
         if prompt.strip() == "/reset":
             self.taints.pop(session_id, None)
             return "Conversation cleared."
 
-        if self.enable_orchestration and self.orchestrator is not None:
-            async def _direct_turn() -> str:
-                original_cb = self.approve_callback
-                if approve_callback is not None:
-                    self.approve_callback = approve_callback
-                try:
+        hook_token = set_turn_event_hook(on_event) if on_event is not None else None
+        original_cb = self.approve_callback
+        if approve_callback is not None:
+            self.approve_callback = approve_callback
+
+        try:
+            if self.enable_orchestration and self.orchestrator is not None:
+                async def _direct_turn() -> str:
                     state = await self.run_state(prompt, session_id=session_id)
                     for msg in reversed(state["messages"]):
                         if isinstance(msg, AIMessage):
                             return str(msg.content)
                     return ""
-                finally:
-                    self.approve_callback = original_cb
 
-            output, _ = await self.orchestrator.orchestrate_turn(
-                prompt=prompt,
-                session_id=session_id,
-                direct_turn_fn=_direct_turn,
-            )
-            return output
+                output, _ = await self.orchestrator.orchestrate_turn(
+                    prompt=prompt,
+                    session_id=session_id,
+                    direct_turn_fn=_direct_turn,
+                )
+                return output
 
-        original_cb = self.approve_callback
-        if approve_callback is not None:
-            self.approve_callback = approve_callback
-        try:
             state = await self.run_state(prompt, session_id=session_id)
             for msg in reversed(state["messages"]):
                 if isinstance(msg, AIMessage):
                     return str(msg.content)
             return ""
         finally:
+            if hook_token is not None:
+                reset_turn_event_hook(hook_token)
             self.approve_callback = original_cb
 
     async def run_state(self, prompt: str, session_id: str = "default") -> AgentState:
@@ -491,6 +605,7 @@ class Agent:
         request_id: str,
         text: str,
         approve: Any = None,
+        on_event: TurnEventCallback | None = None,
     ) -> str:
         """Handle turn with session context, deduplication, commands, and persistence."""
         with session_scope(session, request_id):
@@ -544,6 +659,7 @@ class Agent:
             original_cb = self.approve_callback
             if approve is not None:
                 self.approve_callback = approve
+            hook_token = set_turn_event_hook(on_event) if on_event is not None else None
             try:
                 if self.enable_orchestration and self.orchestrator is not None:
                     async def _direct_turn() -> str:
@@ -585,6 +701,8 @@ class Agent:
                             final_reply = str(msg.content)
                             break
             finally:
+                if hook_token is not None:
+                    reset_turn_event_hook(hook_token)
                 self.approve_callback = original_cb
 
             # Persist turn in memory
@@ -610,4 +728,8 @@ __all__ = [
     "ApproveCallback",
     "OrchestrationConfig",
     "ToolExecutor",
+    "TurnEventCallback",
+    "get_turn_event_hook",
+    "reset_turn_event_hook",
+    "set_turn_event_hook",
 ]
