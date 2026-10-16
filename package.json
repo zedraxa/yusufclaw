@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -b",
     "typecheck": "tsc -b && tsc -p tsconfig.tests.json",
-    "test": "pnpm build && vitest run --maxWorkers=2",
+    "test": "pnpm build && vitest run --maxWorkers=2 && pnpm --filter @yusufclaw/infra run test --runInBand",
     "check": "pnpm typecheck && pnpm test",
     "cli": "pnpm build && node packages/gateway/dist/main.js cli",
     "telegram": "pnpm build && node packages/gateway/dist/main.js telegram",

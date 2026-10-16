@@ -1,0 +1,26 @@
+# Node dependencies
+node_modules/
+.pnpm-store/
+
+# CDK output
+cdk.out/
+.cdk.staging/
+
+# Build artifacts
+dist/
+*.tsbuildinfo
+
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+
+# Testing & Coverage
+coverage/
+
+# OS and Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

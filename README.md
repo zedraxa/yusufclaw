@@ -1,6 +1,6 @@
 # YusufClaw
 
-A local-first personal AI agent. Includes a TypeScript/pnpm monorepo, a tool-calling agent loop, AWS Bedrock, Ollama and OpenAI-compatible providers, persistent SQLite conversations, CLI/Telegram/web channels, trusted Markdown skills, and scheduled routines. No AWS infrastructure is provisioned.
+A local-first personal AI agent. Includes a TypeScript/pnpm monorepo, a tool-calling agent loop, AWS Bedrock, Ollama and OpenAI-compatible providers, persistent SQLite conversations, CLI/Telegram/web channels, trusted Markdown skills, scheduled routines, and shell/file/web/browser/delegation tools. No AWS infrastructure is provisioned.
 
 ## Requirements and installation
 
@@ -205,10 +205,10 @@ Existing environment variables take precedence over `.env`. Configuration is val
 | Package | Responsibility |
 | --- | --- |
 | `@yusufclaw/models` | Shared message/tool contracts, Bedrock Converse, Ollama and OpenAI-compatible adapters |
-| `@yusufclaw/tools` | Tool interface, approval hook, read-only `current_time` tool |
+| `@yusufclaw/tools` | Clock, shell, scoped files, web fetch, optional Playwright browser and local agent delegation |
 | `@yusufclaw/core` | Bounded agent loop, JSON-schema argument validation, SQLite memory, skill loading and routine scheduler |
 | `@yusufclaw/gateway` | Authorized message bus, configuration, CLI, Telegram and web entry points; routine delivery |
-| `@yusufclaw/infra` | Reserved package; no deployable resources in Phase 1 |
+| `@yusufclaw/infra` | AWS CDK stack and Jest assertions; see [infra README](packages/infra/README.md) |
 | `skills/` | Trusted Markdown instructions loaded into the system prompt |
 
 Adapters normalize input into the message bus. The bus checks authorization and builds a session key from channel, user, and conversation. The core serializes turns per session within one process, loads recent complete turns, asks the model, validates and executes requested tools, and repeats until it gets a final response. All tool results are preserved with their call IDs. A successful turn is saved in one SQLite statement; a failed turn is not added to history. Model and tool failures cannot leave half a conversation in memory.
@@ -217,9 +217,21 @@ SQLite uses WAL and a busy timeout. The database file is created with mode 0600 
 
 ## Security and tool scope
 
-Phase 1 ships only `current_time`. Shell execution, file modification, web fetching, browser control, and agent delegation are not enabled. The tool registry validates arguments against JSON Schema, rejects unknown tools, bounds tool batches and model steps, and sanitizes tool failures. Additional tools are trusted application code and must honor the passed abort signal and validate their own operational limits.
+The default registry includes `current_time`, `shell`, `file_read`, `file_write`,
+`file_list`, `web_fetch`, `browser`, and `delegate_agent`. File tools are scoped to
+the working directory (including symlink checks). Shell execution has an
+executable allowlist, working-directory checks, timeouts and output limits;
+these are application checks, **not an OS sandbox**. Shell command arguments can
+access paths outside the workspace. Use only on a trusted host with trusted users.
+Web fetch bounds response size/time and blocks known metadata endpoints; it does
+not block every private-network destination. Browser use requires separately
+installed Playwright and Chromium. Local agent delegation requires
+`ENABLE_AGENT_DELEGATION=true` and an installed `agy` or `codex` CLI.
 
-Tools marked `requiresApproval` execute only after an explicit positive callback. Interactive CLI asks the user to type `yes`; one-shot CLI and Telegram deny approval-required tools. The approval flag is a contract, **not an OS sandbox**. Future shell/browser tools must add isolation before being enabled. Failed turns cannot roll back external actions, so future state-changing tools also need durable action journaling and idempotency.
+File writes, delegation and commands classified as dangerous require explicit
+approval. Interactive CLI asks for `yes`; one-shot CLI, Telegram, web and routine
+turns deny approval-required calls. Tool arguments are schema-validated and tool
+failures sanitized. External actions have no rollback or durable action journal.
 
 `.env`, SQLite databases, dependencies, and build output are ignored by Git. Do not place credentials in prompts or commit them. CLI access trusts the local OS user; `CLI_USER_ID` is a namespace, not remote authentication.
 
@@ -229,10 +241,21 @@ Tools marked `requiresApproval` execute only after an explicit positive callback
 pnpm build       # Compile all workspace packages
 pnpm typecheck   # Check application and test types
 pnpm test        # Build and run offline tests
-pnpm check       # Typecheck and tests (also used by CI)
+pnpm check       # Typecheck, application tests and infra Jest tests (also used by CI)
+pnpm --filter @yusufclaw/infra build
+pnpm --filter @yusufclaw/infra run test --runInBand
 pnpm cli --help
 ```
 
 Tests cover SQLite reopen/isolation, history retention, reset, tool execution/approval/validation, iteration limits, concurrent turns, provider wire formats and error handling, gateway authorization, Telegram filtering/offsets/retries/chunking, and an actual compiled CLI process against a local HTTP Ollama fixture. Phase 2 adds local HTTP OpenAI tool round trips and failure cases, authenticated web API tests, shared history/reset/replay, skill filtering/injection, cron parsing, delivery authorization/retries/deduplication and cancellation. No AWS account, Telegram token, running Ollama, or paid calls are needed for tests. Live provider/account access must be checked separately when configuring your environment.
 
 See [SPEC.md](SPEC.md) for the project scope and [PROGRESS.md](PROGRESS.md) for delivery status and next work.
+
+## Infrastructure workspace
+
+`packages/infra` was imported from `~/projects/yusufclaw-infra`, retaining its CDK
+source, documentation and Jest tests. It uses the root workspace lockfile and
+keeps its own build/test scripts. Root builds include infra; Vitest runs application
+tests and Jest runs CDK assertions separately. No deployment is performed by checks.
+The webhook is an acknowledgement scaffold, not yet connected to the agent loop.
+Review the infra README before any separately authorized deployment.

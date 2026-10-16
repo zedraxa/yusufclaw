@@ -47,7 +47,7 @@ Verified with Node v20.20.2 and pnpm 9.15.9:
 
 The host's default Node was v18.19.1, so verification used an isolated Node 20/pnpm 9 toolchain without changing the global installation. Live AWS account/model access, a running Ollama model, and Telegram delivery were not exercised; external transports were mocked or served by the local fixture.
 
-## What's next
+## Phase 1 follow-up plan (historical)
 
 The spec names only Phase 1's delivery boundary. Suggested next work for its broader roadmap:
 
@@ -58,7 +58,7 @@ The spec names only Phase 1's delivery boundary. Suggested next work for its bro
 5. Add a durable Telegram outbox and cross-process session coordination. Current delivery is at least once; send/offset crashes or partial chunk failures can duplicate replies.
 6. Design and validate CDK infrastructure, DynamoDB memory, S3 files, and webhook/heavy-job hosting before a separately authorized AWS deployment. WhatsApp and email remain later channels.
 
-Current operational limits: memory is plaintext on the local host, history selection is turn-count based, skill files are not executed, and there are no shell/file/browser/delegation tools or cloud resources. The approval interface is not a sandbox. Run one writer per conversation; Phase 1's session queue does not coordinate separate processes.
+Phase 1 operational limits (historical): memory is plaintext on the local host, history selection is turn-count based, skill files are not executed, and there are no shell/file/browser/delegation tools or cloud resources. The approval interface is not a sandbox. Run one writer per conversation; Phase 1's session queue does not coordinate separate processes.
 
 
 # Phase 2 tools progress
@@ -166,3 +166,26 @@ restart. Live external provider and Telegram access were not exercised.
 
 `packages/tools` and `packages/infra` were not modified. No AWS deployment, real
 credentials, or pushes were performed.
+
+# Main integration — 2026-10-16
+
+- Merged `phase2-tools`, then `phase2-models-web`; gateway startup now combines
+  the complete default tool registry with skills, OpenAI, authenticated web and routines.
+- Imported tracked CDK project files from `yusufclaw-infra` commit
+  `613c5a1e571cfc96925783917a007e569f06a1e9` into `packages/infra` by copy.
+  Dependencies, CDK output and build artifacts were excluded. The existing
+  `packages/*` workspace glob includes infra; dependencies use the root lockfile.
+- Preserved the infra CommonJS build and Jest tests, enabled TypeScript project
+  references, and included Jest in root `pnpm check`. Vitest is scoped to application tests.
+- Extended the compiled OpenAI/skills/routines test to check full tool registration.
+- Known limits: shell checks are not OS isolation; browser/delegation require
+  optional local dependencies. Infra still needs webhook-to-agent integration,
+  compiled Lambda deployment packaging and an application container image.
+  Budget notifications do not enforce a hard spending cap. Existing scheduler
+  delivery/cross-process limits remain as documented above.
+- No AWS-mutating commands or deployment were run during integration.
+- Verification: isolated Node v20.20.2 / pnpm 9.15.9; `pnpm install`,
+  `pnpm check`, and standalone infra build passed. **68 Vitest tests in 9 files
+  plus 6 Jest tests in 1 suite (74 total)** passed. CDK emitted a Lambda Node 20
+  runtime deprecation warning; review the runtime before deployment.
+- A credential-pattern scan found no matches in tracked/imported files.

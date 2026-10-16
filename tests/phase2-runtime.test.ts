@@ -8,7 +8,7 @@ import { expect, it } from 'vitest';
 const exec = promisify(execFile);
 it('runs configured OpenAI skills/routines through the compiled entry point and shuts down cleanly', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'yc-phase2-'));
-  const requests: Array<{ messages: Array<{ content: string }> }> = [];
+  const requests: Array<{ messages: Array<{ content: string }>; tools: Array<{ function: { name: string } }> }> = [];
   const server = createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk;
     requests.push(JSON.parse(body));
@@ -36,6 +36,9 @@ it('runs configured OpenAI skills/routines through the compiled entry point and 
     child.kill('SIGTERM');
     expect(await exited).toEqual({ code: 0, signal: null }); expect(stderr).toBe('');
     expect(requests).toHaveLength(1);
+    expect(requests[0].tools.map(tool => tool.function.name)).toEqual(expect.arrayContaining([
+      'current_time', 'shell', 'file_read', 'file_write', 'file_list', 'web_fetch', 'browser', 'delegate_agent',
+    ]));
     expect(requests[0].messages[0].content).toContain('Use the trusted planning instruction.');
     expect(requests[0].messages.at(-1)?.content).toBe('Make a plan');
     await expect(exec(process.execPath, [entry, 'web'], { env })).rejects.toMatchObject({ code: 1 });
