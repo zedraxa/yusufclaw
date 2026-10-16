@@ -45,9 +45,34 @@ class GatewayConfig(BaseModel):
 
     allowed_ids: list[str] = Field(default_factory=list, alias="allowedIds")
 
+    # WhatsApp Business Cloud API Settings
+    WHATSAPP_ACCESS_TOKEN: str | None = None
+    WHATSAPP_PHONE_NUMBER_ID: str | None = None
+    WHATSAPP_APP_SECRET: str | None = None
+    WHATSAPP_VERIFY_TOKEN: str | None = None
+    WHATSAPP_ALLOWED_NUMBERS: str = ""
+    allowed_whatsapp_numbers: list[str] = Field(
+        default_factory=list, alias="allowedWhatsappNumbers"
+    )
+
+    # Voice Subsystem Settings
+    VOICE_ENABLED: bool = False
+    VOICE_STT_PROVIDER: str = "fake"
+    VOICE_TTS_PROVIDER: str = "fake"
+    VOICE_REPLY_AS_AUDIO: bool = False
+    OPENAI_STT_MODEL: str = "whisper-1"
+    OPENAI_TTS_MODEL: str = "tts-1"
+    OPENAI_TTS_VOICE: str = "alloy"
+    WHISPER_MODEL_SIZE: str = "base"
+    POLLY_VOICE_ID: str = "Joanna"
+
     @property
     def allowedIds(self) -> list[str]:
         return self.allowed_ids
+
+    @property
+    def allowedWhatsappNumbers(self) -> list[str]:
+        return self.allowed_whatsapp_numbers
 
     @field_validator("TELEGRAM_BOT_TOKEN", mode="before")
     @classmethod
@@ -75,6 +100,14 @@ class GatewayConfig(BaseModel):
             d["OPENAI_MODEL"] = None
         if d.get("TELEGRAM_BOT_TOKEN") == "":
             d["TELEGRAM_BOT_TOKEN"] = None
+        if d.get("WHATSAPP_ACCESS_TOKEN") == "":
+            d["WHATSAPP_ACCESS_TOKEN"] = None
+        if d.get("WHATSAPP_PHONE_NUMBER_ID") == "":
+            d["WHATSAPP_PHONE_NUMBER_ID"] = None
+        if d.get("WHATSAPP_APP_SECRET") == "":
+            d["WHATSAPP_APP_SECRET"] = None
+        if d.get("WHATSAPP_VERIFY_TOKEN") == "":
+            d["WHATSAPP_VERIFY_TOKEN"] = None
         return d
 
     @model_validator(mode="after")
@@ -98,6 +131,15 @@ class GatewayConfig(BaseModel):
             if not uid.isdigit() or int(uid) <= 0:
                 raise ValueError("TELEGRAM_ALLOWED_USER_IDS must contain numeric user IDs")
         self.allowed_ids = allowed
+
+        raw_wa = (
+            self.WHATSAPP_ALLOWED_NUMBERS.split(",")
+            if self.WHATSAPP_ALLOWED_NUMBERS
+            else []
+        )
+        self.allowed_whatsapp_numbers = [
+            re.sub(r"\D", "", num) for num in raw_wa if re.sub(r"\D", "", num)
+        ]
 
         parsed_url = urlparse(self.OLLAMA_BASE_URL)
         if parsed_url.scheme not in ("http", "https"):
