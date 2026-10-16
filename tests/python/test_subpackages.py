@@ -14,7 +14,7 @@ import yusufclaw.skills as skills
 import yusufclaw.telemetry as telemetry
 import yusufclaw.tools as tools
 from yusufclaw.gateway.telegram import TelegramAdapter
-from yusufclaw.queue import RedisQueue, get_redis_client
+from yusufclaw.queue.worker import RedisWakeup
 
 
 def test_subpackages_docstrings() -> None:
@@ -45,28 +45,16 @@ def test_telemetry_setup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_queue_mocked() -> None:
-    """Verify RedisQueue push and pop behavior with mocked Redis client."""
-    mock_redis = MagicMock()
-    mock_redis.rpush = AsyncMock(return_value=1)
-    mock_redis.blpop = AsyncMock(return_value=("yusufclaw:tasks", b"payload-123"))
-    mock_redis.llen = AsyncMock(return_value=1)
-
-    rq = RedisQueue(client=mock_redis, queue_name="yusufclaw:tasks")
-    push_res = await rq.push("payload-123")
-    assert push_res == 1
-
-    pop_res = await rq.pop(timeout=1)
-    assert pop_res == "payload-123"
-
-    depth = await rq.length()
-    assert depth == 1
-
-
-def test_get_redis_client() -> None:
-    """Verify get_redis_client returns a client configured with the provided URL."""
-    client = get_redis_client("redis://127.0.0.1:6379/1")
-    assert client is not None
+async def test_redis_wakeup_mocked() -> None:
+    """Redis only holds disposable hints; outages must not lose jobs."""
+    wakeup = RedisWakeup("redis://127.0.0.1:6379/1")
+    await wakeup.close()
+    mock = MagicMock()
+    mock.lpush = AsyncMock(side_effect=ConnectionError())
+    mock.blpop = AsyncMock(side_effect=ConnectionError())
+    wakeup.client = mock
+    await wakeup.notify()
+    await wakeup.wait(0.01)
 
 
 @pytest.mark.asyncio
