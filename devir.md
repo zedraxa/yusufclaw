@@ -74,7 +74,68 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   9. Mevcut turn geçmişi ve `/reset` davranışı ile uyumluluk.
   10. `createMemoryTools` doğrudan çağrı ve şema doğrulaması.
 
-## 4. Sonraki Ajan İçin Notlar
+## 4. Önceki Aşama Notları
 - Bellek altyapısı `packages/core` içinde tamamen hazır ve `packages/gateway` tarafından doğrudan kullanılabilir durumdadır.
 - AWS altyapısına henüz deploy yapılmamıştır (`packages/infra` kuralları korunmuştur).
-- Git dalı `phase3-memory` üzerindedir; uzak depoya push yapılmamalıdır.
+
+## 5. Python Yeniden Yazımı (Step 0: İskelet / Scaffold) — `python` Dalı
+
+### 5.1 Genel Mimari ve Kararlar
+- YusufClaw sistemi TypeScript'ten Python 3.12 (`uv`) altyapısına taşınmaktadır.
+- Mevcut TypeScript paketleri (`packages/`) ve vitest testleri (`tests/*.test.ts`) silinmemiş veya değiştirilmemiştir; davranış referansı olarak korunmaktadır.
+- LangGraph durum makinesi (`StateGraph`), FastAPI web arayüzü, Pydantic-Settings yapılandırması ve Typer CLI aracı devreye alınmıştır.
+
+### 5.2 Gerçekleştirilen Bileşenler
+1. **Paket Yönetimi ve Araç Zinciri (`pyproject.toml`, `uv.lock`)**:
+   - Python `>=3.12` hedefi.
+   - Bağımlılıklar: `langgraph`, `langchain-core`, `fastapi`, `uvicorn`, `pydantic-settings`, `boto3`, `httpx`, `openai`, `typer`, `redis`, `opentelemetry-api`, `opentelemetry-sdk`.
+   - Geliştirme araçları: `pytest`, `pytest-asyncio`, `ruff`, `mypy`, `types-redis`.
+2. **Yapılandırma (`src/yusufclaw/config.py`)**:
+   - Pydantic-settings tabanlı strongly-typed yapılandırma; `.env` ve ortam değişkenlerini otomatik okur.
+   - `model_provider`, `aws_profile`, `aws_region`, `bedrock_model_id`, `ollama_*`, `openai_*`, `redis_url`, `database_url` vb.
+3. **Model Sağlayıcı Katmanı (`src/yusufclaw/models/`)**:
+   - `ModelProvider` soyut arayüzü (`types.py`).
+   - `FakeProvider`: Testler ve offline CLI çalıştırmaları için deterministik yanıt üretici.
+   - `OllamaProvider`: Local `/api/chat` HTTP istemcisi.
+   - `OpenAIProvider`: OpenAI Chat Completions uyumlu istemci.
+   - `BedrockProvider`: AWS Bedrock Converse API (`boto3`) entegrasyonu; profile ve region yapılandırması; lazy istemci başlatımı (testlerde gerçek AWS çağrısı yapmaz).
+   - `get_model_provider()`: Yapılandırmaya göre doğru sağlayıcıyı üreten fabrika.
+4. **LangGraph Ajan Döngüsü (`src/yusufclaw/agent.py`)**:
+   - `AgentState`: `messages` (`add_messages` reducer ile) ve `step_count`.
+   - `model_node`: Mesajları normalize edip model sağlayıcısına iletir.
+   - `tool_node`: Modelin talep ettiği araç çağrılarını asenkron olarak çalıştırır.
+   - Koşullu kenar (`should_continue`): Araç çağrısı varsa ve `max_steps` aşılmadıysa `tool_node`'a, aksi takdirde `END`'e yönlendirir.
+   - `Agent.run(prompt)` ve `Agent.run_state(prompt)` temiz arayüzleri.
+5. **Alt Paketler ve Dokümantasyon (`src/yusufclaw/`)**:
+   - `security/`: Deterministik politika motoru, taint tracking, onay kartları kapsam dokümantasyonu.
+   - `memory/`: SQLite FTS5 ve pgvector kalıcı bellek mimarisi kapsam dokümantasyonu.
+   - `tools/`: Sandbox shell, dosya, web fetch, tarayıcı, MCP entegrasyonu kapsam dokümantasyonu.
+   - `skills/`: Markdown beceri yaşam döngüsü dokümantasyonu.
+   - `routines/`: Cron tabanlı zamanlanmış görevler dokümantasyonu.
+   - `telemetry/`: OpenTelemetry `setup_telemetry`, `get_tracer`, `get_meter` araçları.
+   - `queue/`: Redis async istemcisi ve `RedisQueue` FIFO kuyruk soyutlaması.
+   - `gateway/telegram.py`: Telegram Bot API adaptör taslağı ve dokümantasyonu.
+6. **Web Gateway (`src/yusufclaw/gateway/web.py`)**:
+   - FastAPI uygulaması; `GET /health` uç noktası (durum, versiyon, servis adı, model sağlayıcı).
+7. **CLI Giriş Noktası (`src/yusufclaw/gateway/cli.py`)**:
+   - Typer tabanlı `yusufclaw` komutu.
+   - `yusufclaw turn "<mesaj>" --provider fake`: Tek turn ajan döngüsü çalıştırır ve yanıtı konsola basar.
+   - `yusufclaw chat`: Etkileşimli veya argümanlı sohbet.
+   - `yusufclaw version`: Versiyon bilgisi.
+8. **Yerel Servisler (`docker-compose.dev.yml`)**:
+   - `postgres`: `pgvector/pgvector:pg16` veritabanı (5432).
+   - `redis`: `redis:7-alpine` mesaj kuyruğu (6379).
+9. **Kılavuz Belgesi (`PYTHON-SCAFFOLD.md`)**:
+   - Proje yerleşimi, mimari bileşenler ve çalıştırma komutlarının kapsamlı dökümü.
+
+### 5.3 Test ve Doğrulama
+- `uv run ruff check`: 0 hata, tam uyum.
+- `uv run mypy src`: 0 hata, 20 kaynak dosyasında tam strict tip denetimi.
+- `uv run pytest`: 23 testin tamamı offline, sahte sağlayıcılarla ve sıfır dış bağımlılıkla başarıyla geçmiştir.
+- `uv run yusufclaw turn "Hello" --provider fake`: CLI üzerinden LangGraph döngüsü başarıyla test edilmiştir.
+
+### 5.4 Sonraki Adımlar
+- TypeScript testlerinden güvenlik kurallarını ve taint tracking mantığını Python'a taşımak (`src/yusufclaw/security/`).
+- `packages/core/src/memory.ts` içindeki SQLite FTS5 yapılandırılmış bellek mantığını Python'a taşımak (`src/yusufclaw/memory/`).
+- Araç katmanını (shell sandbox, files, fetch) taşımak (`src/yusufclaw/tools/`).
+- Telegram botu ve web AG-UI event stream mekanizmasını bağlamak.
