@@ -59,3 +59,58 @@ The spec names only Phase 1's delivery boundary. Suggested next work for its bro
 6. Design and validate CDK infrastructure, DynamoDB memory, S3 files, and webhook/heavy-job hosting before a separately authorized AWS deployment. WhatsApp and email remain later channels.
 
 Current operational limits: memory is plaintext on the local host, history selection is turn-count based, skill files are not executed, and there are no shell/file/browser/delegation tools or cloud resources. The approval interface is not a sandbox. Run one writer per conversation; Phase 1's session queue does not coordinate separate processes.
+
+## Phase 2 models/web/skills
+
+Implemented on `phase2-models-web`:
+
+- OpenAI-compatible nonstreaming Chat Completions provider in `packages/models`:
+  env-selected base URL, API key and model, function tool schemas/call IDs/results,
+  history translation, output limit, timeout/cancellation, response validation,
+  redirect rejection and sanitized failures.
+- Small web HTTP adapter and static chat page in `packages/gateway`. Defaults to
+  `127.0.0.1:3000`; requires `WEB_AUTH_TOKEN`. Chat and scheduled replies require
+  bearer authentication and use the existing authorized message bus/core. Includes
+  input/body limits, cross-origin API rejection, plain-text rendering, named
+  sessions, replay/reset and graceful cancellation. Tokens are not persisted in
+  browser storage or URLs. `pnpm web` starts it.
+- Trusted Markdown skill loading in `packages/core`: deterministic recursive
+  loading from `skills/` (configurable), system-prompt injection, size/depth bounds,
+  and exclusion of README, hidden entries, symlinks and executable files. No code
+  execution, include expansion, tool installation or remote fetching.
+- Configured routines in `packages/core`: five-field numeric UTC cron with lists,
+  ranges and steps, validated JSON files, serialized execution, stable occurrence
+  IDs and SQLite completion markers. Dispatch goes through the shared bus;
+  gateway delivery supports CLI/stdout, allowlisted Telegram private chats and an
+  authenticated web inbox. `pnpm routines` runs a dedicated scheduler; web and
+  Telegram modes also start it when configured. Ordinary CLI does not.
+- README, skill-folder guidance and `.env.example` updated with configuration,
+  commands, routine examples and operational limits. No new dependencies.
+
+Verification used the existing isolated Node **v20.20.2** / pnpm **9.15.9** toolchain
+from the npm cache, without changing the system Node installation:
+
+- `pnpm install --frozen-lockfile` passed.
+- `pnpm check` passed: application/test TypeScript checks and **53 tests in 8 files**.
+- Local HTTP OpenAI fixtures verify real tool round trips, auth/base path, history,
+  omitted empty tools, malformed JSON/arguments, incomplete responses, HTTP errors,
+  timeout and cancellation. Existing Phase 1 tests continue to pass.
+- Web HTTP tests cover token enforcement, origin/input/body checks, history/session
+  isolation, replay/reset, sanitized errors, scheduled inbox delivery and shutdown.
+- Core tests cover skill filtering/injection/limits, config validation, cron
+  semantics, delivery retries with model reply reuse, persisted deduplication,
+  overlapping ticks, target authorization and cancellation.
+- A compiled-entry-point integration test loads skills and a routine file, calls
+  the local OpenAI fixture, delivers to CLI/stdout, exits cleanly on SIGTERM, and
+  verifies web startup rejects a missing auth token.
+
+Operational limits: use one scheduler process per config/database. Missed minutes
+are skipped; failed deliveries retry only while their scheduled minute is current.
+A send/completion-marker crash can duplicate Telegram/stdout delivery; there is no
+transactional outbox or cross-process lock. The web inbox retains the last 100
+replies and deduplicates occurrence IDs. Web is a single trusted-user UI, with all
+token holders sharing the configured identity. Skills and routines reload only on
+restart. Live external provider and Telegram access were not exercised.
+
+`packages/tools` and `packages/infra` were not modified. No AWS deployment, real
+credentials, or pushes were performed.
