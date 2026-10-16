@@ -28,6 +28,7 @@ from yusufclaw.models.types import (
     ToolCall,
     ToolDefinition,
 )
+from yusufclaw.orchestration import AdaptiveOrchestrator, OrchestrationConfig
 from yusufclaw.security import (
     ActionCard,
     ActionCardStore,
@@ -75,6 +76,8 @@ class Agent:
         card_store: ActionCardStore | None = None,
         approve_callback: ApproveCallback | None = None,
         skills: str | None = None,
+        enable_orchestration: bool = False,
+        orchestration_config: OrchestrationConfig | None = None,
     ) -> None:
         if isinstance(memory, str):
             system_prompt = memory
@@ -91,6 +94,7 @@ class Agent:
         self.card_store = card_store or ActionCardStore()
         self.approve_callback = approve_callback
         self.taints: dict[str, SessionTaint] = {}
+        self.enable_orchestration = enable_orchestration
 
         self._memory_tools_map: dict[str, MemoryTool] = {}
         if self.memory is not None:
@@ -102,6 +106,16 @@ class Agent:
 
         self.tools_by_name: dict[str, ToolDefinition] = {t.name: t for t in self.tools}
         self.graph = self._build_graph()
+
+        self.orchestrator: AdaptiveOrchestrator | None = None
+        if self.enable_orchestration:
+            cfg = orchestration_config or OrchestrationConfig(enabled=True)
+            self.orchestrator = AdaptiveOrchestrator(
+                provider=self.provider,
+                config=cfg,
+                tools=self.tools,
+                grants=self.grants,
+            )
 
     def get_taint(self, session_id: str) -> SessionTaint:
         """Get or initialize the taint state for a session."""
@@ -425,6 +439,27 @@ class Agent:
             self.taints.pop(session_id, None)
             return "Conversation cleared."
 
+        if self.enable_orchestration and self.orchestrator is not None:
+            async def _direct_turn() -> str:
+                original_cb = self.approve_callback
+                if approve_callback is not None:
+                    self.approve_callback = approve_callback
+                try:
+                    state = await self.run_state(prompt, session_id=session_id)
+                    for msg in reversed(state["messages"]):
+                        if isinstance(msg, AIMessage):
+                            return str(msg.content)
+                    return ""
+                finally:
+                    self.approve_callback = original_cb
+
+            output, _ = await self.orchestrator.orchestrate_turn(
+                prompt=prompt,
+                session_id=session_id,
+                direct_turn_fn=_direct_turn,
+            )
+            return output
+
         original_cb = self.approve_callback
         if approve_callback is not None:
             self.approve_callback = approve_callback
@@ -510,23 +545,47 @@ class Agent:
             if approve is not None:
                 self.approve_callback = approve
             try:
-                initial_state: AgentState = {
-                    "messages": [*history_messages, HumanMessage(content=text)],
-                    "step_count": 0,
-                    "session_id": session,
-                }
-                async with trace_agent_turn(session_id=session, request_id=request_id) as turn_span:
-                    final_state: AgentState = await self.graph.ainvoke(initial_state)
-                    if turn_span.is_recording():
-                        turn_span.set_attribute("yusufclaw.turn.step_count", final_state.get("step_count", 0))
+                if self.enable_orchestration and self.orchestrator is not None:
+                    async def _direct_turn() -> str:
+                        state: AgentState = {
+                            "messages": [*history_messages, HumanMessage(content=text)],
+                            "step_count": 0,
+                            "session_id": session,
+                        }
+                        async with trace_agent_turn(session_id=session, request_id=request_id) as turn_span:
+                            res_state: AgentState = await self.graph.ainvoke(state)
+                            if turn_span.is_recording():
+                                turn_span.set_attribute(
+                                    "yusufclaw.turn.step_count", res_state.get("step_count", 0)
+                                )
+                        for msg in reversed(res_state["messages"]):
+                            if isinstance(msg, AIMessage):
+                                return str(msg.content)
+                        return ""
+
+                    final_reply, _ = await self.orchestrator.orchestrate_turn(
+                        prompt=text,
+                        session_id=session,
+                        direct_turn_fn=_direct_turn,
+                    )
+                else:
+                    initial_state: AgentState = {
+                        "messages": [*history_messages, HumanMessage(content=text)],
+                        "step_count": 0,
+                        "session_id": session,
+                    }
+                    async with trace_agent_turn(session_id=session, request_id=request_id) as turn_span:
+                        final_state: AgentState = await self.graph.ainvoke(initial_state)
+                        if turn_span.is_recording():
+                            turn_span.set_attribute("yusufclaw.turn.step_count", final_state.get("step_count", 0))
+
+                    final_reply = ""
+                    for msg in reversed(final_state["messages"]):
+                        if isinstance(msg, AIMessage):
+                            final_reply = str(msg.content)
+                            break
             finally:
                 self.approve_callback = original_cb
-
-            final_reply = ""
-            for msg in reversed(final_state["messages"]):
-                if isinstance(msg, AIMessage):
-                    final_reply = str(msg.content)
-                    break
 
             # Persist turn in memory
             if self.memory is not None:
@@ -544,4 +603,11 @@ class Agent:
             return final_reply
 
 
-__all__ = ["Agent", "AgentState", "ApproveCallback", "ToolExecutor"]
+__all__ = [
+    "AdaptiveOrchestrator",
+    "Agent",
+    "AgentState",
+    "ApproveCallback",
+    "OrchestrationConfig",
+    "ToolExecutor",
+]
