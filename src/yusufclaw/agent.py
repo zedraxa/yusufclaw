@@ -129,6 +129,7 @@ class Agent:
         self.grants = grants
         self.card_store = card_store or ActionCardStore()
         self.approve_callback = approve_callback
+        self.question_callback: Any = None
         self.turn_callback = turn_callback
         self.taints: dict[str, SessionTaint] = {}
         self.enable_orchestration = enable_orchestration
@@ -677,6 +678,8 @@ class Agent:
         text: str,
         approve: Any = None,
         on_event: TurnEventCallback | None = None,
+        signal: Any = None,
+        ask_question: Any = None,
     ) -> str:
         """Handle turn with session context, deduplication, commands, and persistence."""
         with session_scope(session, request_id):
@@ -728,8 +731,11 @@ class Agent:
                             history_messages.append(AIMessage(content=str(content)))
 
             original_cb = self.approve_callback
+            original_q_cb = getattr(self, "question_callback", None)
             if approve is not None:
                 self.approve_callback = approve
+            if ask_question is not None:
+                self.question_callback = ask_question
             hook_token = set_turn_event_hook(on_event) if on_event is not None else None
             try:
                 if self.enable_orchestration and self.orchestrator is not None:
@@ -777,6 +783,7 @@ class Agent:
                 if hook_token is not None:
                     reset_turn_event_hook(hook_token)
                 self.approve_callback = original_cb
+                self.question_callback = original_q_cb
 
             # Persist turn in memory
             if self.memory is not None:
