@@ -39,6 +39,13 @@ from yusufclaw.security import (
     decide,
     render_card,
 )
+from yusufclaw.telemetry import (
+    record_model_response,
+    trace_agent_turn,
+    trace_approval_wait,
+    trace_model_call,
+    trace_tool_call,
+)
 from yusufclaw.tools.manifest import GuardedTool
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
@@ -176,7 +183,9 @@ class Agent:
                 messages=model_messages,
                 tools=self.tools,
             )
-            response = await self.provider.complete(request)
+            async with trace_model_call(self.provider, request) as model_span:
+                response = await self.provider.complete(request)
+                record_model_response(model_span, response, provider=self.provider)
 
             lc_tool_calls: list[dict[str, Any]] = [
                 {
@@ -224,10 +233,15 @@ class Agent:
 
                 # Memory tools: execute directly (trusted, no egress)
                 if name in self._memory_tools_map:
-                    try:
-                        output = await self._memory_tools_map[name].execute(args)
-                    except Exception as e:
-                        output = f"Tool execution error: {e}"
+                    async with trace_tool_call(
+                        name=name, call_id=call_id, args=args, is_guarded=False
+                    ) as tool_ctx:
+                        try:
+                            output = await self._memory_tools_map[name].execute(args)
+                            tool_ctx.set_status("success")
+                        except Exception as e:
+                            output = f"Tool execution error: {e}"
+                            tool_ctx.set_status("error")
                     results.append(
                         ToolMessage(
                             content=output,
@@ -239,6 +253,10 @@ class Agent:
 
                 # 1. Unknown tool check
                 if tool_def is None and self.tool_executor is None:
+                    async with trace_tool_call(
+                        name=name, call_id=call_id, args=args, is_guarded=False
+                    ) as tool_ctx:
+                        tool_ctx.set_status("error")
                     results.append(
                         ToolMessage(
                             content="Unknown tool",
@@ -275,6 +293,13 @@ class Agent:
                 # 4. Evaluate deterministic security policy
                 decision = decide(manifest, args_value, taint, self.grants)
                 if decision.kind == "deny":
+                    async with trace_tool_call(
+                        name=name,
+                        call_id=call_id,
+                        args=args,
+                        is_guarded=isinstance(tool_def, GuardedTool),
+                    ) as tool_ctx:
+                        tool_ctx.set_status("policy_denied")
                     results.append(
                         ToolMessage(
                             content=f"Tool policy denied: {decision.reason}",
@@ -301,13 +326,26 @@ class Agent:
 
                     approved = False
                     if self.approve_callback is not None:
-                        try:
-                            tc_obj = ToolCall(id=call_id, name=name, input=args)
-                            approved = await self.approve_callback(tc_obj, action_card)
-                        except Exception:
-                            approved = False
+                        async with trace_approval_wait(
+                            action_card=action_card,
+                            tool_name=name,
+                        ) as app_ctx:
+                            try:
+                                tc_obj = ToolCall(id=call_id, name=name, input=args)
+                                approved = await self.approve_callback(tc_obj, action_card)
+                                app_ctx.set_status("approved" if approved else "denied")
+                            except Exception:
+                                approved = False
+                                app_ctx.set_status("error")
 
                     if not approved:
+                        async with trace_tool_call(
+                            name=name,
+                            call_id=call_id,
+                            args=args,
+                            is_guarded=isinstance(tool_def, GuardedTool),
+                        ) as tool_ctx:
+                            tool_ctx.set_status("approval_denied")
                         results.append(
                             ToolMessage(
                                 content="Tool approval denied",
@@ -318,36 +356,44 @@ class Agent:
                         continue
 
                 # 6. Tool execution
-                try:
-                    if isinstance(tool_def, GuardedTool):
-                        output = await tool_def.execute(args)
-                    elif self.tool_executor:
-                        output = await self.tool_executor(name, args)
-                    else:
-                        output = f"Executed {name} with args {args}"
+                async with trace_tool_call(
+                    name=name,
+                    call_id=call_id,
+                    args=args,
+                    is_guarded=isinstance(tool_def, GuardedTool),
+                ) as tool_ctx:
+                    try:
+                        if isinstance(tool_def, GuardedTool):
+                            output = await tool_def.execute(args)
+                        elif self.tool_executor:
+                            output = await self.tool_executor(name, args)
+                        else:
+                            output = f"Executed {name} with args {args}"
+                        tool_ctx.set_status("success")
 
-                    # 7. Update taint if tool ingested untrusted data
-                    if "read_untrusted" in manifest.effects:
-                        taint.contaminated = True
-                        if name not in taint.sources:
-                            taint.sources.append(name)
-                except Exception as e:
-                    err_msg = str(e)
-                    if any(
-                        kw in err_msg
-                        for kw in (
-                            "restricted sensitive path",
-                            "restricted sensitive file",
-                            "SSRF",
-                            "outside workspace",
-                            "allowlist",
-                            "Tool policy denied",
-                            "Tool approval denied",
-                        )
-                    ):
-                        output = err_msg
-                    else:
-                        output = f"Tool execution error: {err_msg}"
+                        # 7. Update taint if tool ingested untrusted data
+                        if "read_untrusted" in manifest.effects:
+                            taint.contaminated = True
+                            if name not in taint.sources:
+                                taint.sources.append(name)
+                    except Exception as e:
+                        tool_ctx.set_status("error")
+                        err_msg = str(e)
+                        if any(
+                            kw in err_msg
+                            for kw in (
+                                "restricted sensitive path",
+                                "restricted sensitive file",
+                                "SSRF",
+                                "outside workspace",
+                                "allowlist",
+                                "Tool policy denied",
+                                "Tool approval denied",
+                            )
+                        ):
+                            output = err_msg
+                        else:
+                            output = f"Tool execution error: {err_msg}"
 
                 results.append(
                     ToolMessage(
@@ -393,13 +439,16 @@ class Agent:
 
     async def run_state(self, prompt: str, session_id: str = "default") -> AgentState:
         """Run a conversational turn and return the final LangGraph state."""
-        initial_state: AgentState = {
-            "messages": [HumanMessage(content=prompt)],
-            "step_count": 0,
-            "session_id": session_id,
-        }
-        final_state: AgentState = await self.graph.ainvoke(initial_state)
-        return final_state
+        async with trace_agent_turn(session_id=session_id) as turn_span:
+            initial_state: AgentState = {
+                "messages": [HumanMessage(content=prompt)],
+                "step_count": 0,
+                "session_id": session_id,
+            }
+            final_state: AgentState = await self.graph.ainvoke(initial_state)
+            if turn_span.is_recording():
+                turn_span.set_attribute("yusufclaw.turn.step_count", final_state.get("step_count", 0))
+            return final_state
 
     async def handle(
         self,
@@ -466,7 +515,10 @@ class Agent:
                     "step_count": 0,
                     "session_id": session,
                 }
-                final_state: AgentState = await self.graph.ainvoke(initial_state)
+                async with trace_agent_turn(session_id=session, request_id=request_id) as turn_span:
+                    final_state: AgentState = await self.graph.ainvoke(initial_state)
+                    if turn_span.is_recording():
+                        turn_span.set_attribute("yusufclaw.turn.step_count", final_state.get("step_count", 0))
             finally:
                 self.approve_callback = original_cb
 
