@@ -60,7 +60,9 @@ async def async_main(args: list[str] | None = None) -> None:
         from yusufclaw.config import Settings
 
         settings_dict = config.model_dump()
-        settings = Settings(**{k.lower(): v for k, v in settings_dict.items()})
+        settings = Settings(
+            **{k.lower(): v for k, v in settings_dict.items() if v is not None}
+        )
         provider = get_model_provider(settings)
 
     # Wire SQLite Memory
