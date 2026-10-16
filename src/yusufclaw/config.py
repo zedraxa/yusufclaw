@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     openai_api_key: str | None = Field(default=None, description="API key for OpenAI-compatible endpoints.")
     openai_model: str = Field(default="gpt-4o-mini", description="Model name for OpenAI.")
 
+    # Model Routing Settings
+    enable_model_routing: bool = Field(default=False, description="Enable role-based adaptive model routing.")
+    routing_default_provider: str = Field(default="default", description="Default provider name for routing.")
+    routing_strong_provider: str = Field(default="strong", description="Strong provider name (bedrock, openai, strong).")
+    routing_cheap_provider: str = Field(default="cheap", description="Cheap/local provider name (ollama, cheap).")
+    routing_prefer_cheap_for_simple: bool = Field(default=False, description="Prefer cheap provider for simple, low-risk turns.")
+
     # Model Execution Limits
     max_tokens: int = Field(default=2048, ge=1, description="Max response tokens.")
     model_timeout_ms: int = Field(default=120000, ge=1000, description="Model request timeout in ms.")
