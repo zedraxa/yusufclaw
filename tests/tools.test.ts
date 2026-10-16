@@ -337,3 +337,68 @@ describe('YC-01: Workspace and restricted secrets isolation', () => {
     await expect(shell.execute({ command: 'cat .git/config' })).rejects.toThrow('restricted sensitive');
   });
 });
+
+describe('YC-02: SSRF post-DNS and redirect validation', () => {
+  it('blocks direct access to 127.0.0.1:11434 and 10.0.0.1 per acceptance criteria', async () => {
+    const tool = createWebFetchTool();
+
+    // 127.0.0.1:11434 (Ollama) blocked
+    await expect(tool.execute({ url: 'http://127.0.0.1:11434' })).rejects.toThrow('blocked for security');
+
+    // 10.0.0.1 (RFC 1918 private IP) blocked
+    await expect(tool.execute({ url: 'http://10.0.0.1' })).rejects.toThrow('blocked for security');
+
+    // Other private / loopback / link-local addresses
+    await expect(tool.execute({ url: 'http://192.168.1.1' })).rejects.toThrow('blocked for security');
+    await expect(tool.execute({ url: 'http://172.16.0.10:8080' })).rejects.toThrow('blocked for security');
+    await expect(tool.execute({ url: 'http://[::1]:3000' })).rejects.toThrow('blocked for security');
+    await expect(tool.execute({ url: 'http://localhost:3000' })).rejects.toThrow('blocked for security');
+  });
+
+  it('blocks domains that resolve via DNS to private/loopback IPs', async () => {
+    // Custom dnsLookup resolving a public-looking domain to 127.0.0.1
+    const mockDns = vi.fn(async (_host: string) => [
+      { address: '127.0.0.1', family: 4 }
+    ]);
+
+    const tool = createWebFetchTool({ dnsLookup: mockDns });
+    await expect(tool.execute({ url: 'https://evil-rebind.com/api' })).rejects.toThrow('blocked for security');
+    expect(mockDns).toHaveBeenCalledWith('evil-rebind.com');
+  });
+
+  it('blocks redirect chains targeting private/loopback addresses', async () => {
+    // Mock fetcher: public URL redirects to 127.0.0.1:11434
+    const mockFetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        statusText: 'Found',
+        headers: { location: 'http://127.0.0.1:11434/api/generate' }
+      })
+    );
+
+    const tool = createWebFetchTool({
+      fetcher: mockFetcher,
+      dnsLookup: async () => [{ address: '93.184.215.14', family: 4 }]
+    });
+
+    await expect(tool.execute({ url: 'https://attacker-redirector.com/go' })).rejects.toThrow('blocked for security');
+  });
+
+  it('blocks redirect chains targeting 10.0.0.1', async () => {
+    const mockFetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(null, {
+        status: 301,
+        statusText: 'Moved Permanently',
+        headers: { location: 'http://10.0.0.1/admin' }
+      })
+    );
+
+    const tool = createWebFetchTool({
+      fetcher: mockFetcher,
+      dnsLookup: async () => [{ address: '93.184.215.14', family: 4 }]
+    });
+
+    await expect(tool.execute({ url: 'https://legit-site.com/bounce' })).rejects.toThrow('blocked for security');
+  });
+});
+

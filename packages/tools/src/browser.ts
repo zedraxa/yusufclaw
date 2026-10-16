@@ -1,4 +1,5 @@
 import type { AgentTool } from './index.js';
+import { validateHostSSRF } from './fetch.js';
 
 export interface PageMock {
   goto(url: string, options?: { timeout?: number; waitUntil?: string }): Promise<unknown>;
@@ -65,6 +66,8 @@ export function createBrowserTool(options: BrowserToolOptions = {}): AgentTool {
       if (!['http:', 'https:'].includes(parsed.protocol)) {
         throw new Error(`Unsupported protocol: ${parsed.protocol}. Only HTTP and HTTPS are permitted.`);
       }
+
+      await validateHostSSRF(parsed.hostname);
 
       const reqTimeout = typeof input.timeoutMs === 'number' && Number.isFinite(input.timeoutMs) ? input.timeoutMs : defaultTimeoutMs;
       const effectiveTimeout = Math.min(Math.max(1000, reqTimeout), maxTimeoutMs);
