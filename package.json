@@ -15,11 +15,13 @@
     "cli": "pnpm build && node packages/gateway/dist/main.js cli",
     "telegram": "pnpm build && node packages/gateway/dist/main.js telegram",
     "web": "pnpm build && node packages/gateway/dist/main.js web",
-    "routines": "pnpm build && node packages/gateway/dist/main.js routines"
+    "routines": "pnpm build && node packages/gateway/dist/main.js routines",
+    "evals": "vitest run tests/evals.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
     "typescript": "~5.7.3",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "yaml": "^2.9.1"
   }
 }

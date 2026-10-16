@@ -2,7 +2,7 @@ import { Ajv, type ValidateFunction } from 'ajv';
 import type { Message, ModelProvider } from '@yusufclaw/models';
 import type { AgentTool, ApproveTool } from '@yusufclaw/tools';
 import { SqliteMemory } from './memory.js';
-import { decide, Grants, type ActionCard, type SessionTaint, type Value } from './policy/index.js';
+import { decide, Grants, renderCard, type ActionCard, type SessionTaint, type Value } from './policy/index.js';
 
 export class Agent {
   private readonly tools = new Map<string, { tool: AgentTool; validate: ValidateFunction }>();
@@ -111,6 +111,8 @@ export class Agent {
           if (decision.kind === 'card') {
             needsApproval = true;
             actionCard = decision.card;
+          } else if (needsApproval) {
+            actionCard = renderCard(manifest, argsValue, taint);
           }
 
           if (needsApproval && !(await approve?.(call, actionCard))) {
@@ -131,7 +133,11 @@ export class Agent {
           error = true;
           result = cause instanceof Error && (
             ['Unknown tool', 'Invalid tool arguments', 'Tool approval denied'].includes(cause.message) ||
-            cause.message.startsWith('Tool policy denied')
+            cause.message.startsWith('Tool policy denied') ||
+            cause.message.includes('restricted sensitive path') ||
+            cause.message.includes('restricted sensitive file') ||
+            cause.message.includes('Restricted secret path') ||
+            cause.message.includes('SSRF')
           ) ? cause.message : 'Tool execution failed';
         }
         turn.push({ role: 'tool', callId: call.id, name: call.name, text: result.slice(0, 32_000), error });
