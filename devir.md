@@ -895,3 +895,14 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - Ayrı, geçici yerel PostgreSQL 16 konteynerinde aynı kuyruk testleri: **22 passed**. Canlı satır kilidi altında SKIP LOCKED, concurrent idempotency, durum geçişleri, retry, reclaim, iptal, budget/concurrency, worker shutdown, parent/child ve OTel bağlamı doğrulandı.
 - Legacy Redis smoke testi artık opsiyonel wakeup ve Redis kesinti davranışını denetler. Testler AWS veya canlı model çağrısı gerektirmez.
 
+---
+
+## 21. Python Bellek Konsolidasyonu ve Bağlam Sıkıştırma — `py-memcons` Dalı
+
+- Mevcut SQLite/Postgres bellek operasyonları üzerinde `MemoryStore` protokolü ve `ConsolidationJob`: yapılandırılabilir yakın-kopya eşleştirme, revision + gerekçeli forget, kaynak kimlikleri, kesinti sonrası devam ve açık kullanıcı günlük notlarından semantik fact terfisi. Güven yükseltilmez; kaynak notlar pasifleştirilir ve silinen fact tekrar türetilmez.
+- `ContextCompactor`: token bütçesi aşımında eski tam turların özeti; sabit bilgiler, açık işler ve araç sonucu referansları korunur. Deterministik çevrimdışı özetleyici ve mevcut `ModelProvider` arayüzü üzerinden opsiyonel LLM özetleyici; hata halinde yerel fallback, korunmuş bağlam sığmazsa `over_budget` bildirimi. Kalıcı geçmiş değiştirilmez.
+- `memory/context.py` içinde önem × ilgi × üstel yaş bozunması; her iki backend'in mevcut bağlam derlemesine sınırlı aday yeniden sıralaması. Mevcut API ve alias'lar korunur.
+- `tests/python/test_memory_consolidation.py`: 27 çevrimdışı test vakası; iki backend arayüzü, audit/FTS, kapsam/güven, tekrar çalıştırma, terfi/unutma, sıralama, Unicode, araç bağımlılıkları ve bütçe/fallback. Gerçek Postgres gerekmez; async adaptör SQLite üzerinde test edilir.
+- Doğrulama: `uv run pytest -q` → **228 passed, 1 skipped**; `uv run ruff check .` → temiz; `uv run mypy src` → **82 dosyada hata yok**.
+- Kullanım ve sınırlar: `docs/PY-MEMCONS.md`. İş kapsam başına tek yazıcıyla, en fazla 200 aktif kayıt üzerinde çalışır; otomatik zamanlama/agent entegrasyonu eklenmedi. Agent, models, gateway, roles, coordination ve queue değiştirilmedi. AWS kullanılmadı; push yapılmadı. §20 queue worker için ayrılmıştır; mevcut bölümler yeniden numaralandırılmadı.
+
