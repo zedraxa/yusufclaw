@@ -870,3 +870,28 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - 8 yeni test: publish/search/visit, yeniden açılışta kalıcılık, append-only koruması, kapsam ve rollback, eşzamanlı bağlantılar, metadata araması ve doğrulama sınırları.
 - Doğrulama: `uv run pytest -q` → **201 passed, 1 skipped**; `uv run ruff check .` → temiz; `uv run mypy src` → **79 dosyada hata yok**.
 - Kullanım, güven sınırları ve backend sözleşmesi: `docs/PY-COORD.md`. Agent, models, gateway/web.py, roles, queue ve infra_py değiştirilmedi; AWS dağıtımı yapılmadı. §17–18 korunmuştur.
+
+---
+
+## 20. Python Kalıcı İş Kuyruğu — `py-queue` Dalı
+
+### 20.1 Mimari ve Kapsam
+- Redis listesi yerine PostgreSQL kaynaklı kalıcı iş tablosu ve yerel geliştirme için SQLite fallback eklendi. Redis yalnızca isteğe bağlı uyandırma ipucu taşır; kesintisi iş kaybına yol açmaz.
+- PostgreSQL claim işlemi `FOR UPDATE SKIP LOCKED` kullanır. Kullanıcı/rol eşzamanlılık ve bütçe kabulü kısa bir veritabanı kilidiyle atomiktir; handler çalışırken kilit tutulmaz. Kuyruk coordination ve memory altyapısından bağımsızdır.
+- Durumlar: `queued`, `running`, `succeeded`, `failed`, `cancelled`, `waiting_approval`. Öncelik, UTC `run_at`, kullanıcı kapsamlı idempotency, üstel retry/backoff, lease/heartbeat, eski worker fencing ve dead-letter desteklenir.
+- Kullanıcı/rol limitleri veritabanında saklanır. Bütçeler deneme başına muhafazakâr rezervasyonlarla ve yaşam boyu toplam üzerinden uygulanır; takvimsel sıfırlama veya gerçek maliyet iadesi yapılmaz. Subagent mevcut BudgetManager denetimlerini de korur.
+- Parent/child bağlantıları aynı kullanıcıyla sınırlandırılır. Parent iptali alt işleri iptal eder; lease reclaim sonrası başarısız parent'ın açık alt işleri de durdurulur.
+
+### 20.2 Entegrasyon ve İşletim
+- `YUSUFCLAW_QUEUE_ENABLED=1`: rutin tick işleri kuyruğa yazar; sürekli scheduler bir asyncio worker başlatır. Delegasyonlar orchestration parent işi ve subagent child işleri üzerinden yürür. Bayrak üretimde varsayılan kapalı, testlerde varsayılan açıktır; eski rutin sözleşmesi testleri kapalı yolu ayrıca doğrular.
+- `YUSUFCLAW_QUEUE_URL`: PostgreSQL DSN veya `sqlite+aiosqlite:///queue.sqlite`. Handler kayıtları güvenilir provider/grants bağlamıyla yapılır; Python callable veya kimlik bilgileri payload'a yazılmaz.
+- `python -m yusufclaw.queue list|show|events|cancel`: yerel operatör CLI. AG-UI `CUSTOM` progress/durum olayları kalıcı cursor ile okunur. Worker OTel span'ları enqueue trace bağlamını sürdürür.
+- Onay bekleme slotu bırakır; `resume` öncesi mevcut action-card doğrulaması çağıranın sorumluluğundadır. Harici yan etkiler için exactly-once garantisi verilmez; handler idempotency/receipt uygulamalıdır.
+- Tek admission kilidi ve metadata taraması küçük kurulumlar içindir; yüksek ölçek için ayrı sayaçlar, indeksli politikalar ve retention gerekir. Bir denemelik orchestration/subagent işleri çökme sonrası dead-letter olur; plan checkpoint/replay bu kapsamda eklenmedi.
+- Ayrıntılı kullanım ve sınırlar: `docs/PY-QUEUE.md`. `agent.py`, `models/`, `gateway/web.py`, `roles/` ve coordination dosyaları değiştirilmedi. AWS dağıtımı yapılmadı.
+
+### 20.3 Doğrulama
+- `uv run pytest -q && uv run ruff check . && uv run mypy src`: **214 passed, 1 skipped**; Ruff temiz; 78 kaynak dosyasında strict mypy temiz.
+- Ayrı, geçici yerel PostgreSQL 16 konteynerinde aynı kuyruk testleri: **22 passed**. Canlı satır kilidi altında SKIP LOCKED, concurrent idempotency, durum geçişleri, retry, reclaim, iptal, budget/concurrency, worker shutdown, parent/child ve OTel bağlamı doğrulandı.
+- Legacy Redis smoke testi artık opsiyonel wakeup ve Redis kesinti davranışını denetler. Testler AWS veya canlı model çağrısı gerektirmez.
+
