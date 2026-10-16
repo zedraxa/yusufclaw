@@ -440,3 +440,38 @@ def test_lambda_handler_malformed_json() -> None:
     body = json.loads(res["body"])
     assert body["ok"] is False
     assert body["error"] == "Malformed payload"
+
+
+def test_web_agent_function_url_is_streaming_and_token_protected(
+    stack_template: Template,
+) -> None:
+    """Web UI Lambda is exposed via a streaming Function URL with a generated auth secret."""
+    stack_template.has_resource_properties(
+        "AWS::Lambda::Url",
+        {"AuthType": "NONE", "InvokeMode": "RESPONSE_STREAM"},
+    )
+    stack_template.has_resource_properties(
+        "AWS::SecretsManager::Secret",
+        {
+            "Name": "yusufclaw/web/auth-token",
+            "GenerateSecretString": Match.object_like({"PasswordLength": 48}),
+        },
+    )
+    stack_template.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "PackageType": "Image",
+            "Environment": {
+                "Variables": Match.object_like(
+                    {"MODEL_PROVIDER": "bedrock", "WEB_AUTH_SECRET_ARN": Match.any_value()}
+                )
+            },
+        },
+    )
+
+
+def test_no_nat_gateway_or_load_balancer(stack_template: Template) -> None:
+    """Cost guard: no NAT gateways, load balancers, or ECS services (idle-cost drivers)."""
+    stack_template.resource_count_is("AWS::EC2::NatGateway", 0)
+    stack_template.resource_count_is("AWS::ElasticLoadBalancingV2::LoadBalancer", 0)
+    stack_template.resource_count_is("AWS::ECS::Service", 0)

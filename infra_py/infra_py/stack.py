@@ -3,6 +3,7 @@
 from typing import Any
 
 import aws_cdk as cdk
+from aws_cdk import aws_lambda as lambda_
 from constructs import Construct
 
 from infra_py.config import DEFAULT_CONFIG, YusufClawConfig
@@ -12,6 +13,7 @@ from infra_py.constructs.database import YusufClawDatabase
 from infra_py.constructs.heavy_jobs import YusufClawHeavyJobs
 from infra_py.constructs.storage import YusufClawStorage
 from infra_py.constructs.telegram_webhook import YusufClawTelegramWebhook
+from infra_py.constructs.web_agent import YusufClawWebAgent
 
 
 class YusufClawInfraStack(cdk.Stack):
@@ -32,6 +34,7 @@ class YusufClawInfraStack(cdk.Stack):
         id_: str,
         *,
         config: YusufClawConfig | None = None,
+        web_image_code: lambda_.DockerImageCode | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(scope, id_, **kwargs)
@@ -93,6 +96,34 @@ class YusufClawInfraStack(cdk.Stack):
             amount_usd=cfg.monthly_budget_usd,
             alert_email=cfg.alert_email,
         )
+
+        # 7. Internet-facing web UI + AG-UI backend (scale-to-zero Lambda + Function URL)
+        self.web_agent: YusufClawWebAgent | None = None
+        if cfg.enable_web_agent:
+            self.web_agent = YusufClawWebAgent(
+                self,
+                "WebAgent",
+                app_name=cfg.app_name,
+                database=self.database,
+                storage=self.storage,
+                bedrock_permissions=self.bedrock,
+                bedrock_model_id=cfg.default_bedrock_model,
+                auth_secret_name=cfg.web_auth_secret_name,
+                memory_mb=cfg.web_memory_mb,
+                code=web_image_code,
+            )
+            cdk.CfnOutput(
+                self,
+                "WebUiUrl",
+                value=self.web_agent.function_url.url,
+                description="YusufClaw web UI (HTTPS, bearer-token protected)",
+            )
+            cdk.CfnOutput(
+                self,
+                "WebAuthSecretArn",
+                value=self.web_agent.auth_secret.secret_arn,
+                description="Secrets Manager secret holding the web UI access token",
+            )
 
         # ------------------------------------------------------------------------
         # CloudFormation Outputs for easy integration with YusufClaw agent core

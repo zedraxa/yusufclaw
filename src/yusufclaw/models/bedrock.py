@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import boto3
+from botocore.exceptions import ProfileNotFound
 
 from yusufclaw.models.types import (
     Message,
@@ -38,7 +39,11 @@ class BedrockProvider(ModelProvider):
         """Lazily initialize boto3 bedrock-runtime client."""
         if self._client is not None:
             return self._client
-        session = boto3.Session(profile_name=self.profile, region_name=self.region)
+        try:
+            session = boto3.Session(profile_name=self.profile or None, region_name=self.region)
+        except ProfileNotFound:
+            # Running on AWS (Lambda/ECS): use the execution role credentials.
+            session = boto3.Session(region_name=self.region)
         self._client = session.client("bedrock-runtime")
         return self._client
 

@@ -29,7 +29,7 @@ stack = YusufClawInfraStack(
 )
 
 # Resource tagging for cost allocation and inventory tracking
-cdk.Tags.of(stack).add("Project", "YusufClaw")
+cdk.Tags.of(stack).add("Project", "yusufclaw")
 cdk.Tags.of(stack).add("ManagedBy", "AWS-CDK")
 cdk.Tags.of(stack).add("Owner", "yusuf")
 cdk.Tags.of(stack).add("Budget", "50USD")
