@@ -300,3 +300,40 @@ describe('Core agent loop with Phase 2 tools and approvals', () => {
     memory.close();
   });
 });
+
+describe('YC-01: Workspace and restricted secrets isolation', () => {
+  it('denies file_read on .env and other sensitive secret paths', async () => {
+    const ws = makeTempDir();
+    const read = createFileReadTool({ workspaceRoot: ws });
+
+    // file_read .env is rejected per acceptance criteria
+    await expect(read.execute({ path: '.env' })).rejects.toThrow('restricted sensitive');
+    await expect(read.execute({ path: '.env.local' })).rejects.toThrow('restricted sensitive');
+    await expect(read.execute({ path: '.env.production' })).rejects.toThrow('restricted sensitive');
+    await expect(read.execute({ path: 'sub/.env' })).rejects.toThrow('restricted sensitive');
+
+    // *.sqlite
+    await expect(read.execute({ path: 'memory.sqlite' })).rejects.toThrow('restricted sensitive');
+    await expect(read.execute({ path: 'data/app.sqlite' })).rejects.toThrow('restricted sensitive');
+
+    // ~/.aws
+    await expect(read.execute({ path: '~/.aws/credentials' })).rejects.toThrow('restricted sensitive');
+    await expect(read.execute({ path: '.aws/config' })).rejects.toThrow('restricted sensitive');
+
+    // .git/config
+    await expect(read.execute({ path: '.git/config' })).rejects.toThrow('restricted sensitive');
+  });
+
+  it('denies cat ../.env and sensitive shell commands', async () => {
+    const ws = makeTempDir();
+    const shell = createShellTool({ workspaceDir: ws });
+
+    // cat ../.env is rejected per acceptance criteria
+    await expect(shell.execute({ command: 'cat ../.env' })).rejects.toThrow('restricted sensitive');
+    await expect(shell.execute({ command: 'cat .env' })).rejects.toThrow('restricted sensitive');
+    await expect(shell.execute({ command: 'head -n 1 .env.local' })).rejects.toThrow('restricted sensitive');
+    await expect(shell.execute({ command: 'cat .data/memory.sqlite' })).rejects.toThrow('restricted sensitive');
+    await expect(shell.execute({ command: 'cat ~/.aws/credentials' })).rejects.toThrow('restricted sensitive');
+    await expect(shell.execute({ command: 'cat .git/config' })).rejects.toThrow('restricted sensitive');
+  });
+});

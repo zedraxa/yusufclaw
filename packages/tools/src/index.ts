@@ -1,6 +1,6 @@
 import type { ToolCall, ToolDefinition } from '@yusufclaw/models';
 import { createShellTool, shellTool, type ShellToolOptions } from './shell.js';
-import { createFileTools, fileReadTool, fileWriteTool, fileListTool, type FileToolsOptions } from './files.js';
+import { createFileTools, fileReadTool, fileWriteTool, fileListTool, DEFAULT_WORKSPACE_DIR, type FileToolsOptions } from './files.js';
 import { createWebFetchTool, webFetchTool, type WebFetchToolOptions } from './fetch.js';
 import { createBrowserTool, browserTool, type BrowserToolOptions } from './browser.js';
 import { createDelegateAgentTool, delegateAgentTool, type DelegateAgentToolOptions } from './delegate.js';
@@ -47,7 +47,7 @@ export interface DefaultToolsOptions {
  * - delegate_agent (runs agy or codex CLI as subprocess, disabled unless enabled)
  */
 export function createDefaultTools(options: DefaultToolsOptions = {}): AgentTool[] {
-  const ws = options.workspaceDir;
+  const ws = options.workspaceDir || process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE_DIR;
   return [
     currentTime,
     createShellTool({ workspaceDir: ws, ...options.shell }),

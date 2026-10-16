@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
+import { existsSync, mkdirSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { AgentTool } from './index.js';
+import { DEFAULT_WORKSPACE_DIR } from './files.js';
 
 export interface ShellToolOptions {
   workspaceDir?: string;
@@ -24,6 +26,25 @@ const SAFE_READ_ONLY_BINARIES = new Set([
   'ls', 'dir', 'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep',
   'diff', 'sort', 'uniq', 'jq'
 ]);
+
+/**
+ * Checks whether a shell command attempts to access restricted sensitive paths
+ * (.env*, *.sqlite, ~/.aws, .git/config) or path traversal.
+ */
+export function containsRestrictedPath(command: string): boolean {
+  if (!command || typeof command !== 'string') return false;
+  // 1. .env* (.env, .env.local, ../.env, etc.)
+  if (/(^|[\s/"'=\\])\.env([a-zA-Z0-9_.-]*)/.test(command)) return true;
+  // 2. *.sqlite (*.sqlite, memory.sqlite, etc.)
+  if (/\.sqlite($|-|\b|\d)/i.test(command)) return true;
+  // 3. ~/.aws or .aws
+  if (/(^|[\s/"'=\\])(\~?\/)?\.aws([/\s"'\\$]|$)/.test(command)) return true;
+  // 4. .git/config
+  if (/\.git\/config/.test(command)) return true;
+  // 5. Path traversal attempts like ../
+  if (/(^|[\s"'=])\.\.\/|\/\.\.(\/|$|\s|["'])/.test(command)) return true;
+  return false;
+}
 
 /**
  * Extracts binary names from a shell command string to verify against an allowlist.
@@ -92,6 +113,10 @@ export function isDangerousCommand(command: string): boolean {
     }
   }
 
+  if (containsRestrictedPath(trimmed)) {
+    return true;
+  }
+
   // Check all segments: if any segment binary is not in SAFE_READ_ONLY_BINARIES, require approval
   const binaries = extractCommandBinaries(trimmed);
   if (!binaries.length) return true;
@@ -116,7 +141,11 @@ export function isDangerousCommand(command: string): boolean {
 }
 
 export function createShellTool(options: ShellToolOptions = {}): AgentTool {
-  const workspaceDir = resolve(process.cwd(), options.workspaceDir || process.env.WORKSPACE_DIR || '.');
+  const defaultWs = resolve(process.cwd(), DEFAULT_WORKSPACE_DIR);
+  const workspaceDir = resolve(process.cwd(), options.workspaceDir || process.env.WORKSPACE_DIR || defaultWs);
+  if (!existsSync(workspaceDir)) {
+    try { mkdirSync(workspaceDir, { recursive: true, mode: 0o755 }); } catch {}
+  }
   const allowed = new Set(
     options.allowedCommands ||
     (process.env.SHELL_ALLOWED_COMMANDS ? process.env.SHELL_ALLOWED_COMMANDS.split(',').map(s => s.trim()).filter(Boolean) : DEFAULT_ALLOWED_COMMANDS)
@@ -146,6 +175,10 @@ export function createShellTool(options: ShellToolOptions = {}): AgentTool {
       signal?.throwIfAborted();
       const rawCommand = typeof input.command === 'string' ? input.command.trim() : '';
       if (!rawCommand) throw new Error('Command must be a non-empty string');
+
+      if (containsRestrictedPath(rawCommand)) {
+        throw new Error(`Command references restricted sensitive file or path traversal: ${rawCommand}`);
+      }
 
       // Allowlist verification
       const binaries = extractCommandBinaries(rawCommand);

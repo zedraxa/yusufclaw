@@ -8,9 +8,38 @@ export interface FileToolsOptions {
   maxListEntries?: number;
 }
 
+export const DEFAULT_WORKSPACE_DIR = '.data/workspace';
+
+/**
+ * Checks if a given path references restricted sensitive secrets:
+ * .env*, *.sqlite*, ~/.aws*, or .git/config.
+ */
+export function isRestrictedSecretPath(pathStr: string): boolean {
+  if (!pathStr || typeof pathStr !== 'string') return false;
+  const normalized = pathStr.replace(/\\/g, '/').trim();
+  const segments = normalized.split('/').filter(Boolean);
+  const baseName = segments[segments.length - 1] ?? '';
+
+  // 1. .env* (.env, .env.local, .env.production, etc.)
+  if (baseName === '.env' || baseName.startsWith('.env.') || baseName.startsWith('.env')) return true;
+  if (segments.some(s => s === '.env' || s.startsWith('.env.') || s.startsWith('.env'))) return true;
+
+  // 2. *.sqlite (*.sqlite, *.sqlite-wal, *.sqlite-journal, *.sqlite3)
+  if (/\.sqlite($|-|\b|\d)/i.test(baseName)) return true;
+  if (segments.some(s => /\.sqlite($|-|\b|\d)/i.test(s))) return true;
+
+  // 3. ~/.aws or .aws
+  if (segments.includes('.aws') || normalized.includes('.aws/') || normalized.endsWith('.aws')) return true;
+
+  // 4. .git/config
+  if (normalized.includes('.git/config') || (baseName === 'config' && segments.includes('.git'))) return true;
+
+  return false;
+}
+
 /**
  * Confines a path strictly to workspaceRoot, preventing any path traversal,
- * symlink escape, or null byte injections.
+ * symlink escape, null byte injections, or access to sensitive secret files.
  */
 export function resolveSafePath(workspaceRoot: string, userPath: string): string {
   if (typeof userPath !== 'string' || !userPath.trim()) {
@@ -20,9 +49,17 @@ export function resolveSafePath(workspaceRoot: string, userPath: string): string
     throw new Error('Invalid path: null bytes are forbidden');
   }
 
+  if (isRestrictedSecretPath(userPath)) {
+    throw new Error(`Access to restricted sensitive path is denied: "${userPath}"`);
+  }
+
   const trimmed = userPath.trim();
   const normalized = normalize(trimmed);
   const resolved = isAbsolute(normalized) ? resolve(normalized) : resolve(workspaceRoot, normalized);
+
+  if (isRestrictedSecretPath(resolved) || isRestrictedSecretPath(relative(workspaceRoot, resolved))) {
+    throw new Error(`Access to restricted sensitive path is denied: "${userPath}"`);
+  }
 
   const rel = relative(workspaceRoot, resolved);
   if (rel.startsWith('..') || isAbsolute(rel)) {
@@ -32,6 +69,9 @@ export function resolveSafePath(workspaceRoot: string, userPath: string): string
   // If path already exists, verify its realpath to catch symlinks pointing outside
   if (existsSync(resolved)) {
     const real = realpathSync(resolved);
+    if (isRestrictedSecretPath(real)) {
+      throw new Error(`Access to restricted sensitive path is denied: "${userPath}"`);
+    }
     const realRel = relative(workspaceRoot, real);
     if (realRel.startsWith('..') || isAbsolute(realRel)) {
       throw new Error(`Path escape detected: symlink "${userPath}" resolves outside workspace root`);
@@ -44,6 +84,9 @@ export function resolveSafePath(workspaceRoot: string, userPath: string): string
   while (ancestor.length >= workspaceRoot.length) {
     if (existsSync(ancestor)) {
       const realAncestor = realpathSync(ancestor);
+      if (isRestrictedSecretPath(realAncestor)) {
+        throw new Error(`Access to restricted sensitive path is denied: "${userPath}"`);
+      }
       const realRel = relative(workspaceRoot, realAncestor);
       if (realRel.startsWith('..') || isAbsolute(realRel)) {
         throw new Error(`Path escape detected: parent directory symlink resolves outside workspace root`);
@@ -57,7 +100,11 @@ export function resolveSafePath(workspaceRoot: string, userPath: string): string
 }
 
 export function createFileReadTool(options: FileToolsOptions = {}): AgentTool {
-  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || '.');
+  const defaultWs = resolve(process.cwd(), DEFAULT_WORKSPACE_DIR);
+  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || defaultWs);
+  if (!existsSync(root)) {
+    try { mkdirSync(root, { recursive: true, mode: 0o755 }); } catch {}
+  }
   const defaultMaxBytes = options.maxReadBytes ?? 64_000;
 
   return {
@@ -108,7 +155,11 @@ export function createFileReadTool(options: FileToolsOptions = {}): AgentTool {
 }
 
 export function createFileWriteTool(options: FileToolsOptions = {}): AgentTool {
-  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || '.');
+  const defaultWs = resolve(process.cwd(), DEFAULT_WORKSPACE_DIR);
+  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || defaultWs);
+  if (!existsSync(root)) {
+    try { mkdirSync(root, { recursive: true, mode: 0o755 }); } catch {}
+  }
 
   return {
     name: 'file_write',
@@ -148,7 +199,11 @@ export function createFileWriteTool(options: FileToolsOptions = {}): AgentTool {
 }
 
 export function createFileListTool(options: FileToolsOptions = {}): AgentTool {
-  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || '.');
+  const defaultWs = resolve(process.cwd(), DEFAULT_WORKSPACE_DIR);
+  const root = resolve(process.cwd(), options.workspaceRoot || process.env.WORKSPACE_DIR || defaultWs);
+  if (!existsSync(root)) {
+    try { mkdirSync(root, { recursive: true, mode: 0o755 }); } catch {}
+  }
   const defaultMaxEntries = options.maxListEntries ?? 200;
 
   return {
