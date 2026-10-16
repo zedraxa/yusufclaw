@@ -10,8 +10,54 @@ Implements durable structured memory systems:
   * Procedural: learned skills and execution routines.
 - Revision history and optimistic concurrency control (CAS).
 - Tombstone logging and purge handling for GDPR/right-to-forget compliance.
-
-Note: Logic will be ported from TypeScript packages/core/src/memory.ts and tests.
+- Context assembly with bounded limits and evidence IDs for LLM prompt context.
 """
 
-__all__: list[str] = []
+from yusufclaw.memory.context import (
+    ActiveSessionContext,
+    active_session_context,
+    session_scope,
+)
+from yusufclaw.memory.fts import sanitize_fts5_query, sanitize_tsquery
+from yusufclaw.memory.models import (
+    ContextAssemblyOptions,
+    EmbeddingProvider,
+    ListOptions,
+    MemoryDeletionRecord,
+    MemoryKind,
+    MemoryRecord,
+    MemoryRevisionRecord,
+    MemoryStatus,
+    MemoryTrust,
+    RememberInput,
+    ReviseInput,
+    SearchOptions,
+)
+from yusufclaw.memory.postgres import PostgresMemory
+from yusufclaw.memory.sqlite import SqliteMemory, generate_memory_id
+from yusufclaw.memory.tools import MemoryTool, create_memory_tools
+
+__all__ = [
+    "ActiveSessionContext",
+    "ContextAssemblyOptions",
+    "EmbeddingProvider",
+    "ListOptions",
+    "MemoryDeletionRecord",
+    "MemoryKind",
+    "MemoryRecord",
+    "MemoryRevisionRecord",
+    "MemoryStatus",
+    "MemoryTool",
+    "MemoryTrust",
+    "PostgresMemory",
+    "RememberInput",
+    "ReviseInput",
+    "SearchOptions",
+    "SqliteMemory",
+    "active_session_context",
+    "create_memory_tools",
+    "generate_memory_id",
+    "sanitize_fts5_query",
+    "sanitize_tsquery",
+    "session_scope",
+]
