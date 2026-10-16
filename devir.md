@@ -244,7 +244,6 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - Bellek araçlarını `read_private` etkisiyle güvenlik döngüsüne bağlamak (memory + security birleşik `agent.py` hazır; etki etiketleri sıkılaştırılabilir).
 - Telegram gateway long-polling canlı döngüsünü bağlamak.
 - Kılavuz belgesi: `PY-SECURITY.md`.
-||||||| 008f9aa
 
 ---
 
@@ -299,3 +298,57 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .`: 0 hata, 0 uyarı.
   - `uv run mypy src tests/python`: 43 kaynak dosyasında strict tip denetimi 0 hata ile geçti.
   - `packages/` (TypeScript), `src/yusufclaw/security/`, `src/yusufclaw/tools/`, `src/yusufclaw/memory/` ve AWS yapılandırmalarına dokunulmadı.
+
+---
+
+## 9. Python Skills ve Routines Alt Sistemi — `py-skills` Dalı
+
+### 9.1 Genel Mimari ve Kararlar
+- TypeScript referansındaki `packages/core/src/skills.ts`, `packages/core/src/routines.ts`, `packages/gateway/src/routines.ts` ve `tests/skills-routines.test.ts` birebir Python 3.12, asyncio ve LangGraph uyumlu olarak `src/yusufclaw/skills` ve `src/yusufclaw/routines` altına taşınmıştır.
+- `src/yusufclaw/gateway`, `security`, `tools`, `memory` ve `packages/` dizinlerine kesinlikle dokunulmamıştır (Gateway başka bir işçi tarafından yönetilmektedir).
+- Testlerin ve çalışma ortamının tamamı offline çalışacak şekilde kurgulanmıştır (sıfır ağ, sıfır AWS).
+
+### 9.2 Gerçekleştirilen Bileşenler
+1. **Güvenilir Yerel Beceri Yükleyicisi (`src/yusufclaw/skills/loader.py`, `src/yusufclaw/skills/__init__.py`)**:
+   - `load_skills` (async), `load_skills_sync` (sync) ve `loadSkills` takma adı.
+   - Salt yerel Markdown (`.md`) dosyaları okunur; betikler (`.js`, `.py`, `.sh`), include yapıları ve frontmatter kod çalıştırmaları reddedilir.
+   - Symlink izleme engellenmiştir (`is_symlink()` kontrolü).
+   - Gizli dosyalar (`.*`) ve `README.md` atlanır.
+   - Deterministik alfabetik sıralama garantisi.
+   - Sıkı derinlik ve boyut sınırları:
+     - `MAX_DEPTH = 8`
+     - `MAX_FILE_BYTES = 32_768` (32 KB tek dosya sınırı)
+     - `MAX_TOTAL_BYTES = 131_072` (128 KB kümülatif sınır)
+   - Prompt enjeksiyonu TS ile birebir uyumlu: `Trusted local skill instructions:\n\n### Skill: {name}\n{content}`.
+   - `Agent.__init__` içinde `skills: str | None = None` parametresi ve model çağrısında sistem promptu ile birleştirilerek enjeksiyonu (`[system_prompt, skills, memory_context]`).
+2. **5-Alanlı UTC Cron Ayrıştırıcısı (`src/yusufclaw/routines/cron.py`)**:
+   - `parse_cron` ve `parseCron` takma adı.
+   - Dakika, saat, ayın günü, ay, haftanın günü (0 ve 7 = Pazar).
+   - Liste (`0,15`), aralık (`9-17`), adım (`*/15`, `1-5/2`) desteği.
+   - Standart cron DOM/DOW "OR" semantiği.
+3. **Routines JSON Yapılandırma Yükleyicisi (`src/yusufclaw/routines/loader.py`)**:
+   - `load_routines`, `load_routines_sync` ve `loadRoutines` takma adı.
+   - En fazla 100 rutin kontrolü.
+   - Regex `^[a-zA-Z0-9_-]{1,64}$` ile ID doğrulama ve teklik denetimi.
+   - İzin verilen kanallar: `cli`, `telegram`, `web`.
+   - İstem uzunluğu <= 16.000 karakter.
+   - Hata durumunda konfigürasyon ve gizli içerikleri sızdırmadan deterministik `ValueError("Invalid routines configuration")` fırlatılır.
+4. **Kanal Koşucusu ve Protokoller (`src/yusufclaw/routines/runner.py`)**:
+   - `RoutineTransport` (`dispatch`, `deliver`) ve `RoutineRunner` (`run_routine`) dar Protokolleri.
+   - `ChannelRunner` & `ChannelRunnerOptions`: Gateway koduna dokunmadan CLI stdout, Telegram `sendMessage` (4096 karakter bölmeli) ve Web teslimat adaptasyonu; hedef kanal yetkilendirme doğrulaması.
+   - Web standardı `AbortSignal` ve `AbortController` iptal mekanizmaları.
+5. **Zamanlayıcı ve Kuyruk Destekli Single-Flight (`src/yusufclaw/routines/scheduler.py`)**:
+   - `RoutineScheduler`:
+     - Zamanlayıcı seviyesinde single-flight: Eşzamanlı `tick()` çağrıları aynı Task nesnesini döner (`first is second`).
+     - Bellek durumuna dayalı dakikalık deduplikasyon (`memory.get_state(key) >= minute`).
+     - Teslimat hatasında bir sonraki döngüde önbellekteki model yanıtıyla tekrar deneme.
+     - Başarılı teslimatta SQLite/Postgres durum güncellemesi (`memory.set_state`).
+     - `SingleFlightQueue`: Aynı rutin ID'sinin eşzamanlı olarak iki kez çalışmasını önleyen kuyruk destekli karşılıklı dışlama (mutex) kontrolü.
+   - `create_routine_scheduler` / `createRoutineScheduler` fabrikası.
+
+### 9.3 Test ve Doğrulama
+- **Pytest**: **71 testin tamamı** yeşil geçti (`uv run pytest`, 6.19s).
+- **Ruff**: 0 hata (`uv run ruff check .` -> `All checks passed!`).
+- **Mypy**: 0 hata (`uv run mypy src` -> `Success: no issues found in 41 source files`).
+- **Dokunulmayan Alanlar**: `src/yusufclaw/gateway`, `security`, `tools`, `memory` ve `packages/` %100 temiz ve dokunulmamıştır.
+- **Kılavuz Belgesi**: `PY-SKILLS.md`.
