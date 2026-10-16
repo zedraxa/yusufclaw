@@ -7,6 +7,7 @@ The concrete implementation is owned by the security/tools subsystem.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -141,6 +142,87 @@ def format_telegram_card_message(
     return msg
 
 
+class InMemoryApprovalProvider:
+    """Thread-safe in-memory reference implementation of ApprovalProvider with YC-05 protections."""
+
+    def __init__(self) -> None:
+        self.cards: dict[str, ActionCard] = {}
+        self.records: dict[str, ApprovalRecord] = {}
+        self.expected_args: dict[str, dict[str, Any]] = {}
+
+    def register(self, card: ActionCard, input_args: dict[str, Any] | None = None) -> None:
+        """Register an ActionCard with its expected arguments."""
+        self.cards[card.approval_id] = card
+        self.records[card.approval_id] = ApprovalRecord(
+            card=card,
+            status="pending",
+            input_args=input_args,
+        )
+        if input_args is not None:
+            self.expected_args[card.approval_id] = input_args
+
+    def consume(
+        self,
+        approval_id: str,
+        nonce: str,
+        actual_args: dict[str, Any] | None = None,
+    ) -> ApprovalResult:
+        """Consume an approved action card with nonce, replay, and argument tampering protection."""
+        record = self.records.get(approval_id)
+        if not record:
+            return ApprovalResult(success=False, reason="Action card not found")
+
+        if record.status in ("approved", "consumed"):
+            return ApprovalResult(
+                success=False, reason="Replay detected: action card already consumed"
+            )
+
+        if record.status == "denied":
+            return ApprovalResult(success=False, reason="Action card was denied")
+
+        if record.card.expires_at:
+            try:
+                expires_dt = datetime.fromisoformat(record.card.expires_at)
+                if expires_dt.tzinfo is None:
+                    expires_dt = expires_dt.replace(tzinfo=UTC)
+                if expires_dt < datetime.now(UTC):
+                    record.status = "expired"
+                    return ApprovalResult(
+                        success=False, reason="Action card has expired"
+                    )
+            except Exception:
+                pass
+
+        if record.card.nonce != nonce:
+            return ApprovalResult(
+                success=False, reason="Invalid nonce: nonce mismatch"
+            )
+
+        expected = self.expected_args.get(approval_id)
+        if expected is not None and actual_args is not None:
+            if actual_args != expected:
+                return ApprovalResult(
+                    success=False,
+                    reason="Argument tampering detected: args hash mismatch",
+                )
+
+        record.status = "approved"
+        return ApprovalResult(success=True, card=record.card)
+
+    def deny(self, approval_id: str, nonce: str) -> None:
+        """Deny approval for the specified card and nonce."""
+        record = self.records.get(approval_id)
+        if not record:
+            return
+        if record.card.nonce != nonce:
+            return
+        record.status = "denied"
+
+    def get(self, approval_id: str) -> ApprovalRecord | None:
+        """Retrieve stored approval record by ID."""
+        return self.records.get(approval_id)
+
+
 def build_telegram_card_keyboard(card: ActionCard | dict[str, Any]) -> dict[str, Any]:
     """Build Telegram inline keyboard containing verifiable callback queries."""
     if isinstance(card, dict):
@@ -176,6 +258,7 @@ __all__ = [
     "ApprovalProvider",
     "ApprovalRecord",
     "ApprovalResult",
+    "InMemoryApprovalProvider",
     "build_telegram_card_keyboard",
     "format_telegram_card_message",
 ]
