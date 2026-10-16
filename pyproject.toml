@@ -70,11 +70,12 @@ disallow_incomplete_defs = true
 module = [
     "boto3.*",
     "botocore.*",
+    "yaml.*",
 ]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
 python_files = ["test_*.py"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
