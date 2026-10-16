@@ -13,7 +13,6 @@ import typer
 from rich.console import Console
 
 from yusufclaw import __version__
-from yusufclaw.agent import Agent
 from yusufclaw.config import Settings, get_settings
 from yusufclaw.gateway.bus import IncomingMessage, MessageBus
 from yusufclaw.models import ModelProvider, get_model_provider
@@ -127,6 +126,8 @@ async def _run_agent_turn(
     else:
         overridden = settings.model_copy(update={"model_provider": provider_name.lower()})
         provider = get_model_provider(overridden)
+
+    from yusufclaw.agent import Agent
 
     agent = Agent(
         provider=provider,

@@ -11,7 +11,6 @@ import signal
 import sys
 from typing import Any
 
-from yusufclaw.agent import Agent
 from yusufclaw.gateway.bus import MessageBus
 from yusufclaw.gateway.cli import run_cli
 from yusufclaw.gateway.config import GatewayConfig, load_config
@@ -67,6 +66,8 @@ async def async_main(args: list[str] | None = None) -> None:
     memory = SqliteMemory(config.MEMORY_PATH)
 
     # Wire Core Agent
+    from yusufclaw.agent import Agent
+
     agent = Agent(
         provider=provider,
         memory=memory,
