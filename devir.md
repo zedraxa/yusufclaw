@@ -707,3 +707,39 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `MYPYPATH=src uv run mypy tests/python/test_web_gateway.py`: 0 hata.
 - **Kılavuz Belgesi**: `PY-AGUI.md`.
 
+---
+
+## 16. Python UX Spesifikasyonu ve Kullanıcı Entegrasyonu Tasarımı (`py-ux` Dalı)
+
+### 16.1 Genel Mimari ve Kararlar
+- Grok Bot asistan deneyimi model alınarak hazırlanan, araştırma raporlarına (`docs/RESEARCH.md`, `docs/RESEARCH-ASIST.md`, `docs/DESIGN-RECOMMENDATIONS.md`, `docs/ARCHITECTURE-v2.md`) %100 dayandırılmış kapsamlı kullanıcı entegrasyonu tasarım belgesi `docs/UX-SPEC.md` yazılmıştır.
+- **Birincil Arayüz**: Web UI (UI ile backend arasında AG-UI 1.0 protokolü zorunlu).
+- **Tamamlayıcı Kanallar**: Telegram botu (mobil/acil kanal) ve Terminal CLI (geliştirici/otomasyon kanalı), merkezi gateway ve paylaşılan durum sahipliği ([ADR-01]).
+- **Sıkı Araştırma Dayanağı**: Tüm tasarım kararları literatürdeki makale veya rapor bölümüne atıf yapacak şekilde kurgulanmış; literatürde doğrudan karşılığı bulunmayan mekanizmalar (ör. tarayıcı canlı akışında interaktif CAPTCHA devralma) açıkça `[unbacked - proposal]` olarak etiketlenmiştir.
+- **Yalnızca Dokümantasyon Kuralı**: Uygulama kodu yazılmamış (`docs only`), mevcut kod tabanı ve testler %100 korunmuştur.
+
+### 16.2 Kapsanan Grok-Bot Özellikleri ve AG-UI Olay Protokolü
+1. **Çoklu Adlandırılmış Ajanlar Kenar Çubuğu**: `roles/` altındaki rol kataloğu (`ROLE.md`) ile eşleşen, bağımsız oturum ve bellek kapsamına sahip uzmanlaşmış ajanlar.
+2. **Anında Bilişsel Teyit & Arka Plan Kilometre Taşları**: Kullanıcı mesajına <300ms içinde teyit dönüp girdiyi serbest bırakan, ardından adım adım ilerleyen durum göstergesi (`run.acknowledged`, `run.milestone`).
+3. **Satır İçi Karar & Seçenek Widget'ları**: Serbest metin yerine yapılandırılmış seçenekler sunan interaktif çipler ve onay kutuları (`widget.question`, `action.resolve_widget`).
+4. **Varsayılan Taslak Eylem Kartları (VAC)**: Dış dünyayı etkileyen tüm eylemlerde modelin serbest metninden bağımsız, gerçek argümanlardan üretilen, nonce ve SHA-256 korumalı onay kartları (`widget.approval_card`).
+5. **Maskelenmiş Gizli Bilgi Formları**: Parola ve API anahtarlarının sohbet geçmişine düşmesini engelleyen geçici maskeli modal ve gizli bilgi aracısı.
+6. **OAuth & MCP Bağlayıcı Merkezi**: Gmail, Calendar, Drive, GitHub, Notion, Slack entegrasyonları, açıklama hash'i sabitleme ve karantina mekanizması.
+7. **Rutinler & Otomasyon Paneli**: IANA saat dilimli cron oluşturucu, yetki zarfı ve misfire politikası (`routine.triggered`).
+8. **Görünür & Düzenlenebilir Bellek Yöneticisi**: Profil ve olgusal iddia tablosu, kanıt kimlikleri ve FTS/vektör indekslerinden gerçek unlearning yapan `/forget` akışı.
+9. **Beceri (Skills) Kütüphanesi**: Agent Skills açık standardına uygun YAML ön maddesi, `skills.lock` bütünlük denetimi ve karantina vitrini.
+10. **Ekler & İnteraktif Artefakt Kanvası**: Kod, Markdown ve görsel çıktılar için çift panelli bölünmüş ekran ve görsel fark (diff) görüntüleyici.
+11. **Çok Kanallı Bildirim Motoru**: Web push, masaüstü toast/ses ve Telegram çapraz kanal onay eşitlemesi.
+12. **'Computer' Sandbox & Canlı Tarayıcı Görünümü**: Playwright ve Bubblewrap ortamının JPEG/DOM akışı, egress güvenlik duvarı uyarıları.
+13. **Ajanlar Arası (A2A) Takım Arkadaşları**: Derinlik-1 kısıtlı delegasyon hiyerarşisi, ayrılmış veri/talimat kanalları ve bütçe devri.
+14. **Anlık Kullanım, Token & Maliyet Sayacı**: Turn ve oturum token/maliyet ($ USD) göstergesi, $50 aylık AWS bütçe tavanı çubuğu ve OTel Gantt izleme çekmecesi.
+
+### 16.3 Sıralı Uygulama İş Listesi
+- **Sprint 1 (Temeller)**: UX-01 (AG-UI SSE motoru), UX-02 (Ajanlar kenar çubuğu), UX-03 (Bilişsel teyit & kilometre taşları), UX-04 (Satır içi soru widget'ları).
+- **Sprint 2 (Güvenlik & Bellek)**: UX-05 (ActionCard arayüzü), UX-06 (Maskeli gizli bilgi modalı), UX-07 (Bellek denetim & forget kanvası).
+- **Sprint 3 (Otomasyon & Yetenekler)**: UX-08 (Rutinler paneli), UX-09 (Artefakt kanvası & diff), UX-10 (Computer sandbox & screencast), UX-11 (MCP bağlayıcı merkezi), UX-12 (A2A visualizer), UX-13 (Kullanım ve maliyet sayacı).
+
+### 16.4 Doğrulama
+- Dokümantasyon bütünlüğü kontrol edildi.
+- Test çalıştırma veya kod değişikliği yapılmadı.
+
