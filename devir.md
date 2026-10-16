@@ -467,3 +467,89 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .` -> `All checks passed!` (0 hata, 0 uyarı).
   - `uv run mypy infra_py tests lambda` -> `Success: no issues found in 13 source files` (Strict mod, 0 hata).
 - **Kılavuz Belgesi**: `PY-INFRA.md`.
+
+---
+
+## 12. Python Adaptif Orkestrasyon ve Doğrulama Alt Sistemi (`py-orch` Dalı)
+
+### 12.1 Genel Mimari ve Kararlar
+- `docs/ARCHITECTURE-v2.md` Katman 2 (Meta-orchestrator: task analyzer, budget manager, model routing) ve Katman 8 (Verification & governance: verifier with acceptance criteria, OTel tracing) ile `docs/RESEARCH.md` ve `docs/RESEARCH-ASIST.md` araştırmalarındaki ilkeler eksiksiz olarak yeni bir paket olan `src/yusufclaw/orchestration/` altında uygulanmıştır.
+- **Kapsam İzolasyonu**: `src/yusufclaw/gateway`, `security`, `memory`, `skills`, `routines`, `tools`, `models/` içleri, `infra_py/` ve `packages/` (TypeScript) dizinlerine **kesinlikle dokunulmamıştır**.
+- **Minimal Entegrasyon**: `src/yusufclaw/agent.py` içine yalnızca `enable_orchestration: bool = False` ve `orchestration_config: OrchestrationConfig | None = None` parametreleri eklenmiş; varsayılan durumda (`enable_orchestration=False`) mevcut davranış %100 birebir korunmuştur.
+- **Deep Agents & LangGraph**: LangChain'in resmi `deepagents` pakitesi `uv` ile eklenmiş; ayrıca sıfır dış ağ bağlantısıyla deterministik test edilebilen yerel LangGraph durum makinesi işçi motoru (`SubagentRunner`) geliştirilmiştir.
+- **Offline & Sıfır Ağ Bağımlılığı**: Testlerin tamamı `FakeProvider` ve bellek içi OTel dışa aktarıcısı (`InMemorySpanExporter`) ile harici ağ, AWS veya API anahtarı gerektirmeden çalışmaktadır.
+
+### 12.2 Gerçekleştirilen Mimari Bileşenler
+1. **Veri Modelleri (`src/yusufclaw/orchestration/models.py`)**:
+   - Pydantic v2 tabanlı strongly-typed veri modelleri:
+     - `TaskAnalysis`: `complexity` (`simple` | `medium` | `complex`), `required_tools`, `risk` (`low` | `medium` | `high` | `critical`), `plan_required`, `delegate_required`, `strategy` (`direct` | `plan_and_execute` | `delegate`), `reasoning`, `subtasks`, `estimated_steps`.
+     - `BudgetLimits` & `BudgetUsage`: Turn ve oturum bazında token (prompt, completion, total), maliyet ($ USD), adım sayısı (`steps`) ve geçen süre (`elapsed_seconds`).
+     - `TokenPricing`: Milyon token başına maliyet tablosu (varsayılan prompt $3.00/1M, completion $15.00/1M).
+     - `BudgetStatus` & `BudgetExceededError`: Kalan bütçe payları ve tavan aşımlarında yapılandırılmış durum raporu.
+     - `AcceptanceCriteria` & `VerificationResult`: Kural tabanlı sınır değerler, model hakemi yapılandırması, puan (`score`), telafi istemi (`retry_recommended`, `retry_prompt`).
+     - `SubagentSpec` & `SubagentResult`: AOrchestra / CaMeL uyumlu alt ajan spesifikasyonu (talimat, güvenilmeyen veri kanalı, izinli araçlar, bütçe sınırları).
+     - `PlanStep` & `ExecutionPlan`: Çok adımlı planlama ve durum takibi.
+     - `OrchestrationConfig`: Master orkestrasyon yapılandırması.
+2. **Görev Çözümleyici (`src/yusufclaw/orchestration/task_analyzer.py`)**:
+   - `TaskAnalyzer`:
+     - Deterministik Sezgisel Motor: Metin boyutu, numaralandırılmış adım listeleri (`1. ... 2. ...`), ardışık bağlaçlar (`then`, `after that`, `ve ardından`), araç tespiti (`shell`, `file_read`, `file_write`, `web_fetch`, `memory`) ve risk kalıpları (`rm -rf`, `drop table`, `sudo`, `token`, `password`).
+     - Model Destekli Mod: `ModelProvider` üzerinden JSON şemalı çıkarım; modelin yanıt veremediği veya geçersiz JSON döndürdüğü durumlarda istisna fırlatmadan derhal deterministik sezgisel motora güvenli geri düşüş (`graceful fallback`).
+     - Dağıtık İzleme: `yusufclaw.orchestration.task_analysis` span'ı ile karmaşıklık, risk ve strateji özniteliklerinin kaydı.
+3. **Bütçe Yöneticisi (`src/yusufclaw/orchestration/budget.py`)**:
+   - `BudgetManager`:
+     - Hem tek turn (`turn_usage`) hem de kümülatif oturum (`session_usage`) düzeyinde bağımsız tüketim takibi.
+     - Token fiyatlandırması üzerinden kesin maliyet hesabı.
+     - `check_limits()`: Tavan aşıldığında `is_exceeded=True` ve ayrıntılı ihlal nedeni üretimi.
+     - `get_graceful_stop_message()`: Bütçe tükendiğinde sistemi çökertmeden kullanıcıya korunan durumu ve kısmi çıktıyı bildiren zarif durdurma yanıtı.
+     - Dağıtık İzleme: `yusufclaw.orchestration.budget_check` span'ı.
+4. **Doğrulayıcı (`src/yusufclaw/orchestration/verifier.py`)**:
+   - `Verifier`:
+     - Kural Tabanlı Doğrulama: `min_length`, `max_length`, `required_keywords` (büyük/küçük harf duyarsız), `forbidden_keywords`, `required_pattern` (regex), `must_not_contain_patterns`, `expected_tools` (turn içinde çağrılması zorunlu araçlar).
+     - Model Hakemi: `model_judge_required=True` durumunda JSON rubrik değerlendirmesi ile semantik puanlama.
+     - Tek Tur Otomatik Düzeltme: Doğrulama başarısız olduğunda ve bütçe/deneme hakkı varken (`max_retries=1`) spesifik eksiklikleri içeren `retry_prompt` oluşturarak ajana tam 1 kez telafi hakkı tanıma.
+     - Dağıtık İzleme: `yusufclaw.orchestration.verification` span'ı.
+5. **Alt Ajan Delegasyonu (`src/yusufclaw/orchestration/subagent.py`)**:
+   - `SubagentRunner`:
+     - **En Fazla 1 Derinlik**: Alt ajanın başka bir alt ajan başlatması engellenir (`spec.max_depth = 1`).
+     - **En Az Ayrıcalıklı Kesişim**: Alt ajana yalnızca ebeveynin izin verdiği araçlar arasından talep edilenler verilir (yetki genişletme kesinlikle engellenir).
+     - **Veri Kanalı Ayrımı**: Kullanıcı talimatı güvenilir istem kanalından, bağlam verileri ise güvenilmeyen veri etiketli referans bloğundan aktarılır (multi-agent prompt injection koruması).
+     - **Bütçe Düşümü**: Alt ajanın tükettiği token ve adımlar doğrudan ebeveyn `BudgetManager` hesabından düşülür.
+     - Dağıtık İzleme: `yusufclaw.orchestration.subagent` span'ı.
+6. **Planla ve Yürüt İş Akışı (`src/yusufclaw/orchestration/planner.py`)**:
+   - `PlanAndExecuteWorkflow`:
+     - LangGraph `StateGraph` tabanlı durum makinesi (`planner` -> `execute_step` -> `synthesizer`).
+     - Planlama Düğümü: Görevi `PlanStep` dizisine dönüştürür.
+     - Yürütme Düğümü: Her adımı doğrudan veya `SubagentRunner` specialist işçisine delege eder. Her adım öncesinde bütçe kontrolü yapar; bütçe aşılırsa zarif şekilde sentez düğümüne yönlendirir.
+     - Adım Doğrulama: Adım çıktısını `Verifier` ile kontrol eder, gerekirse 1 tur telafi dener.
+     - Sentez Düğümü: Tamamlanan adımların bulgularını birleştirerek kapsamlı nihai yanıt üretir.
+7. **Meta-Orkestratör Koordinasyonu (`src/yusufclaw/orchestration/orchestrator.py`)**:
+   - `AdaptiveOrchestrator`:
+     - Turn başında bütçe kontrolü yapar; tavan aşılmışsa doğrudan zarif durdurma döner.
+     - Görev Çözümleyiciyi çalıştırır; stratejiye göre ("direct" vs "plan_and_execute" / "delegate") yönlendirir.
+     - Çıktıyı `Verifier` ile denetler; eksiklik varsa tek tur düzeltme döngüsünü tetikler.
+     - Turn sonunda bütçeyi günceller ve dağıtık izleme span'larını (`yusufclaw.orchestration.turn`) tamamlar.
+8. **LangGraph Ajan Entegrasyonu (`src/yusufclaw/agent.py`)**:
+   - `Agent.__init__` içinde `enable_orchestration: bool = False` ve `orchestration_config`.
+   - `Agent.run` ve `Agent.handle`: Bayrak aktif olduğunda `self.orchestrator.orchestrate_turn` üzerinden çalışır; bayrak kapalıyken eski kod yolu aynen korunur.
+
+### 12.3 Test ve Doğrulama
+- **Port Edilen ve Eklenen Testler (`tests/python/test_orchestration.py`)**:
+  - 20 yeni kapsamlı birim ve entegrasyon testi eklendi:
+    - Sezgisel ve model destekli görev çözümleme testleri (basit, orta, karmaşık, araçlı, yüksek/kritik risk).
+    - Model analiz hatasında deterministik motora geri düşüş.
+    - Bütçe token, maliyet ve adım hesaplama testleri.
+    - Turn ve oturum sınır aşımları, zarif durdurma mesajı ve istisna mekanizması.
+    - Kural tabanlı kabul kriterleri ve model hakemi doğrulama testleri.
+    - Doğrulama başarısızlığında 1 tur telafi istemi üretimi.
+    - Alt ajan derinlik kısıtlaması (1'e sabitleme) ve ebeveyn araç kesişimi.
+    - LangGraph planla-ve-yürüt durum makinesi testi.
+    - Adaptif orkestratör doğrudan yol ve doğrulama telafi entegrasyonu.
+    - Ajan `enable_orchestration` bayrak denetimi (kapalı ve açık durumlar).
+    - OpenTelemetry izleme span'larının (`InMemorySpanExporter`) doğrulanması.
+- **Sonuçlar**:
+  - `uv run pytest`: **124 testin tamamı** offline, sahte sağlayıcılarla ve sıfır dış ağ bağlantısıyla yeşil geçti (~10.4s).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 0 hata, 57 kaynak dosyasında tam strict tip denetimi (`Success: no issues found in 57 source files`).
+  - `packages/` (TypeScript), `gateway/`, `security/`, `memory/`, `skills/`, `routines/`, `tools/`, `models/` ve `infra_py/` %100 temiz ve dokunulmamıştır.
+- **Kılavuz Belgesi**: `PY-ORCH.md`.
+
