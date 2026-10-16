@@ -1,6 +1,6 @@
 # YusufClaw
 
-A local-first personal AI agent. Phase 1 provides a TypeScript/pnpm monorepo, a tool-calling agent loop, AWS Bedrock and Ollama providers, persistent SQLite conversations, and CLI and Telegram channels. No AWS infrastructure is provisioned.
+A local-first personal AI agent. Includes a TypeScript/pnpm monorepo, a tool-calling agent loop, AWS Bedrock, Ollama and OpenAI-compatible providers, persistent SQLite conversations, CLI/Telegram/web channels, trusted Markdown skills, and scheduled routines. No AWS infrastructure is provisioned.
 
 ## Requirements and installation
 
@@ -73,14 +73,122 @@ This adapter uses [Telegram long polling](https://core.telegram.org/bots/api#get
 
 Replies are sent as plain text and split into safe chunks. Polling offsets persist in SQLite. Replayed updates reuse completed replies rather than invoking the agent again. Delivery is **at least once**: a crash between sending a reply and saving the offset, or a partial chunk failure, can produce duplicate messages. This is not a transactional Telegram outbox.
 
+## Run with an OpenAI-compatible provider
+
+Set these variables in `.env`, then use any channel:
+
+```dotenv
+MODEL_PROVIDER=openai
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=your-provider-key
+OPENAI_MODEL=your-tool-capable-model
+```
+
+The base URL includes the API prefix (for example `/v1`); the provider appends
+`/chat/completions`. This uses nonstreaming text Chat Completions with function
+tools and `max_tokens`, following the [official OpenAI Chat Completions contract](https://developers.openai.com/api/reference/resources/chat).
+Select an endpoint/model supporting that contract; provider-specific extensions,
+streaming, and reasoning-model token parameters are not implemented. HTTP errors,
+malformed arguments, duplicate tool IDs, and incomplete/truncated responses fail
+the turn without saving partial history. Requests honor the configured timeout
+and cancellation. Redirects are rejected to avoid forwarding credentials.
+
+## Run web chat
+
+Set `WEB_AUTH_TOKEN` to a random private token in `.env`, then run:
+
+```sh
+pnpm web
+```
+
+Open `http://127.0.0.1:3000` and enter that token in the page. Startup refuses a
+missing token. The token stays in the page's memory; it is not placed in URLs or
+browser storage. The static shell is public; all chat and routine-inbox requests
+require `Authorization: Bearer <token>`. The server binds to `127.0.0.1` by
+default. Changing `WEB_HOST` exposes the listener on the chosen interface; use
+HTTPS through a trusted reverse proxy when accessing it remotely.
+
+The minimal page sends plain text, supports named conversations and `/reset`, and
+polls scheduled replies every five seconds. Responses render as text. All token
+holders share `WEB_USER_ID` (default `local`); this is a single trusted-user UI.
+User identity is assigned by the server, never accepted from the request body.
+Cross-origin browser API requests are rejected. Web turns use the same authorized
+bus, tool loop, SQLite history, and request replay behavior as other channels.
+Approval-required tools are denied on web and scheduled turns.
+
+API: `POST /api/chat` accepts JSON `{ "text": "Hello", "conversationId": "default", "requestId": "unique-id" }`
+and returns `{ "reply": "..." }`. Reuse a request ID only when retrying that same
+turn. `GET /api/routines` returns the last 100 scheduled web replies across this
+user's conversations, retained in SQLite. Both endpoints require the bearer token.
+The body limit is 100 KB; messages allow 16,000 characters.
+
+## Trusted skills and scheduled routines
+
+Put trusted `.md` instructions in `skills/`, including nested `SKILL.md` files.
+They are appended to the system prompt at startup for all channels and scheduled
+turns. `README.md`, hidden entries, symlinks and non-Markdown files are ignored.
+The loader allows 32 KiB per file, 128 KiB total and eight nested directories.
+Missing folders are allowed; other read errors fail startup. Markdown is treated
+only as instructions: no scripts, frontmatter actions, includes or URLs are
+executed. These instructions have system-prompt authority; install only trusted
+content. Restart to reload skills or routine configuration.
+
+Set `ROUTINES_CONFIG=.data/routines.json` and create a JSON array like:
+
+```json
+[
+  {
+    "id": "morning-plan",
+    "cron": "0 9 * * 1-5",
+    "prompt": "Help me plan today.",
+    "target": { "channel": "web", "userId": "local", "conversationId": "planning" }
+  }
+]
+```
+
+Run `pnpm web` for this example. `pnpm telegram` also starts configured routines;
+`pnpm routines` runs a dedicated scheduler for CLI/stdout or Telegram delivery.
+Ordinary `pnpm cli` does not start routines. Only run **one scheduler** for a given
+configuration and database. There is no cross-process scheduler lock.
+
+Cron uses **UTC**, five numeric fields (minute, hour, day of month, month, weekday),
+with `*`, comma lists, inclusive ranges and `/` steps; Sunday is 0 or 7. When both
+day fields are restricted they are ORed. Seconds, names and macros such as
+`@daily` are unsupported. Routine IDs must be unique; malformed files and
+unavailable/unauthorized targets fail startup.
+
+Targets use the same channel/user/conversation namespaces as chat:
+
+- `web`: requires web mode, the configured `WEB_USER_ID`, and any conversation ID.
+  Replies appear in the authenticated scheduled-replies inbox.
+- `telegram`: requires a bot token and an allowlisted user ID. `conversationId`
+  must equal that user ID, limiting delivery to the user's private chat.
+- `cli`: requires `CLI_USER_ID`; replies print to the scheduler process's stdout.
+
+The scheduler checks once per second and serializes runs. Completed occurrences
+are recorded in SQLite; a restart in the same minute skips them. Model replies
+are reused if delivery fails and is retried within that minute. Missed minutes,
+including downtime and slow work that spans later ticks, are skipped; there is no
+backfill. Delivery can duplicate after a crash between sending and recording
+completion (or a partial Telegram send). The web inbox deduplicates occurrence
+IDs. Failed occurrences are not retried after their minute; this is not a durable
+outbox. SIGINT/SIGTERM cancel active requests and stop the scheduler.
+
 ## Configuration
 
 | Variable | Default / meaning |
 | --- | --- |
-| `MODEL_PROVIDER` | `bedrock`, or `ollama` |
+| `MODEL_PROVIDER` | `bedrock`, `ollama`, or `openai` |
 | `BEDROCK_MODEL_ID` | Required in Bedrock mode; no assumed model |
 | `AWS_PROFILE`, `AWS_REGION` | `yusufclaw`, `us-east-1` |
 | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | `http://127.0.0.1:11434`, `llama3.2` |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1`; API prefix for Chat Completions |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | Required in OpenAI-compatible mode |
+| `WEB_HOST`, `WEB_PORT` | `127.0.0.1`, `3000` |
+| `WEB_AUTH_TOKEN` | Required in web mode; shared private bearer token |
+| `WEB_USER_ID` | `local`; identity assigned to authenticated web requests |
+| `SKILLS_DIR` | `skills`; trusted local Markdown directory |
+| `ROUTINES_CONFIG` | Unset; path to a JSON array of routines |
 | `MEMORY_PATH` | `.data/memory.sqlite` |
 | `CLI_USER_ID` | `local`; identity for the trusted local CLI |
 | `MAX_TOKENS` | `2048` output tokens |
@@ -96,16 +204,16 @@ Existing environment variables take precedence over `.env`. Configuration is val
 
 | Package | Responsibility |
 | --- | --- |
-| `@yusufclaw/models` | Shared message/tool contracts, Bedrock Converse and Ollama chat adapters |
+| `@yusufclaw/models` | Shared message/tool contracts, Bedrock Converse, Ollama and OpenAI-compatible adapters |
 | `@yusufclaw/tools` | Tool interface, approval hook, read-only `current_time` tool |
-| `@yusufclaw/core` | Bounded agent loop, JSON-schema argument validation, SQLite memory |
-| `@yusufclaw/gateway` | Authorized message bus, configuration, CLI and Telegram entry points |
+| `@yusufclaw/core` | Bounded agent loop, JSON-schema argument validation, SQLite memory, skill loading and routine scheduler |
+| `@yusufclaw/gateway` | Authorized message bus, configuration, CLI, Telegram and web entry points; routine delivery |
 | `@yusufclaw/infra` | Reserved package; no deployable resources in Phase 1 |
-| `skills/` | Reserved for a future trusted skill loader |
+| `skills/` | Trusted Markdown instructions loaded into the system prompt |
 
 Adapters normalize input into the message bus. The bus checks authorization and builds a session key from channel, user, and conversation. The core serializes turns per session within one process, loads recent complete turns, asks the model, validates and executes requested tools, and repeats until it gets a final response. All tool results are preserved with their call IDs. A successful turn is saved in one SQLite statement; a failed turn is not added to history. Model and tool failures cannot leave half a conversation in memory.
 
-SQLite uses WAL and a busy timeout. The database file is created with mode 0600 and new parent directories with mode 0700. History is local plaintext and grows until reset; protect the host and backups. Context is bounded by complete turns, not tokens, so unusually large conversations may still exceed a model's context window. Session keys are intentionally isolated between CLI and Telegram. Run a single writer per conversation; the in-process queue is not a cross-process lock.
+SQLite uses WAL and a busy timeout. The database file is created with mode 0600 and new parent directories with mode 0700. History is local plaintext and grows until reset; protect the host and backups. Context is bounded by complete turns, not tokens, so unusually large conversations may still exceed a model's context window. Session keys are intentionally isolated between CLI, Telegram and web. Run a single writer per conversation; the in-process queue is not a cross-process lock.
 
 ## Security and tool scope
 
@@ -125,6 +233,6 @@ pnpm check       # Typecheck and tests (also used by CI)
 pnpm cli --help
 ```
 
-Tests cover SQLite reopen/isolation, history retention, reset, tool execution/approval/validation, iteration limits, concurrent turns, provider wire formats and error handling, gateway authorization, Telegram filtering/offsets/retries/chunking, and an actual compiled CLI process against a local HTTP Ollama fixture. No AWS account, Telegram token, running Ollama, or paid calls are needed for tests. Live provider/account access must be checked separately when configuring your environment.
+Tests cover SQLite reopen/isolation, history retention, reset, tool execution/approval/validation, iteration limits, concurrent turns, provider wire formats and error handling, gateway authorization, Telegram filtering/offsets/retries/chunking, and an actual compiled CLI process against a local HTTP Ollama fixture. Phase 2 adds local HTTP OpenAI tool round trips and failure cases, authenticated web API tests, shared history/reset/replay, skill filtering/injection, cron parsing, delivery authorization/retries/deduplication and cancellation. No AWS account, Telegram token, running Ollama, or paid calls are needed for tests. Live provider/account access must be checked separately when configuring your environment.
 
 See [SPEC.md](SPEC.md) for the project scope and [PROGRESS.md](PROGRESS.md) for delivery status and next work.
