@@ -28,7 +28,7 @@ from yusufclaw.models.types import (
     Message,
     ModelProvider,
     ModelRequest,
-    ModelResponse,
+    StreamAccumulator,
     ToolCall,
     ToolDefinition,
 )
@@ -237,30 +237,77 @@ class Agent:
             )
             active_p = state.get("active_provider") or self.provider
             hook = get_turn_event_hook() or self.turn_callback
-            stream_fn = getattr(active_p, "stream", None)
-            if callable(stream_fn):
-                accumulated_text: list[str] = []
-                async for chunk in stream_fn(request):
-                    accumulated_text.append(chunk)
-                    if hook is not None:
+            async with trace_model_call(active_p, request) as model_span:
+                stream_fn = getattr(active_p, "stream", None)
+                if callable(stream_fn):
+                    accumulator = StreamAccumulator()
+                    started_streaming = False
+                    try:
+                        async for chunk in stream_fn(request):
+                            started_streaming = True
+                            text_delta, tc_delta, new_tool_calls = accumulator.add(chunk)
+                            if hook is not None:
+                                if text_delta:
+                                    try:
+                                        res = hook("text_delta", {"delta": text_delta})
+                                        if inspect.isawaitable(res):
+                                            await res
+                                    except Exception:
+                                        pass
+                                if tc_delta is not None:
+                                    try:
+                                        res = hook(
+                                            "tool_call_delta",
+                                            {
+                                                "index": tc_delta.index,
+                                                "id": tc_delta.id,
+                                                "name": tc_delta.name,
+                                                "args_delta": tc_delta.args_delta,
+                                                "input": tc_delta.input,
+                                            },
+                                        )
+                                        if inspect.isawaitable(res):
+                                            await res
+                                    except Exception:
+                                        pass
+                                for tc in new_tool_calls:
+                                    try:
+                                        res = hook(
+                                            "tool_call",
+                                            {
+                                                "id": tc.id,
+                                                "name": tc.name,
+                                                "args": tc.input,
+                                            },
+                                        )
+                                        if inspect.isawaitable(res):
+                                            await res
+                                    except Exception:
+                                        pass
+                        response = accumulator.finalize()
+                    except NotImplementedError:
+                        if not started_streaming:
+                            response = await active_p.complete(request)
+                            if hook is not None and response.text:
+                                try:
+                                    res = hook("text_delta", {"text": response.text})
+                                    if inspect.isawaitable(res):
+                                        await res
+                                except Exception:
+                                    pass
+                        else:
+                            raise
+                else:
+                    response = await active_p.complete(request)
+                    if hook is not None and response.text:
                         try:
-                            res = hook("text_delta", {"delta": chunk})
+                            res = hook("text_delta", {"text": response.text})
                             if inspect.isawaitable(res):
                                 await res
                         except Exception:
                             pass
-                response = ModelResponse(text="".join(accumulated_text))
-            else:
-                async with trace_model_call(active_p, request) as model_span:
-                    response = await active_p.complete(request)
-                    record_model_response(model_span, response, provider=active_p)
-                if hook is not None and response.text:
-                    try:
-                        res = hook("text_delta", {"text": response.text})
-                        if inspect.isawaitable(res):
-                            await res
-                    except Exception:
-                        pass
+
+                record_model_response(model_span, response, provider=active_p)
 
             lc_tool_calls: list[dict[str, Any]] = [
                 {

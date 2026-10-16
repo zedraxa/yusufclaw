@@ -60,10 +60,21 @@ def _get_active_tracer(tracer: trace.Tracer | None = None) -> trace.Tracer:
 
 def _resolve_model_metadata(provider: Any) -> tuple[str, str]:
     """Resolve (system_name, model_name) from provider instance."""
+    if hasattr(provider, "get_provider") and callable(provider.get_provider):
+        try:
+            routed = provider.get_provider()
+            if routed is not None and routed is not provider:
+                return _resolve_model_metadata(routed)
+        except Exception:
+            pass
+
     system = getattr(provider, "provider_name", None)
     if not system:
         cls_name = provider.__class__.__name__.lower()
-        system = cls_name.removesuffix("provider") if cls_name.endswith("provider") else cls_name
+        if cls_name.startswith("fake"):
+            system = "fake"
+        else:
+            system = cls_name.removesuffix("provider") if cls_name.endswith("provider") else cls_name
 
     model = (
         getattr(provider, "model", None)
@@ -132,13 +143,56 @@ async def trace_model_call(
     start_time = time.perf_counter()
     system_name, model_name = _resolve_model_metadata(provider)
 
+    target_provider = provider
+    if hasattr(provider, "get_provider") and callable(provider.get_provider):
+        try:
+            routed = provider.get_provider(role or "default")
+            if routed is not None and routed is not provider:
+                target_provider = routed
+        except Exception:
+            pass
+
     with tr.start_as_current_span(SPAN_MODEL_CALL) as span:
         if span.is_recording():
             span.set_attribute(ATTR_GEN_AI_SYSTEM, system_name)
             span.set_attribute(ATTR_GEN_AI_REQUEST_MODEL, model_name)
             span.set_attribute(ATTR_GEN_AI_OPERATION_NAME, "chat")
-            if role:
-                span.set_attribute(ATTR_ROUTING_ROLE, role)
+            effective_role = (
+                role
+                or getattr(target_provider, "_routing_role", None)
+                or getattr(target_provider, "routing_role", None)
+                or getattr(provider, "_routing_role", None)
+                or getattr(provider, "routing_role", None)
+            )
+            if effective_role:
+                span.set_attribute(ATTR_ROUTING_ROLE, str(effective_role))
+
+            routing_provider = (
+                getattr(target_provider, "_routing_provider", None)
+                or getattr(target_provider, "routing_provider", None)
+                or getattr(provider, "_routing_provider", None)
+                or getattr(provider, "routing_provider", None)
+            )
+            if routing_provider:
+                span.set_attribute(ATTR_ROUTING_PROVIDER, str(routing_provider))
+
+            routing_target = (
+                getattr(target_provider, "_routing_target", None)
+                or getattr(target_provider, "routing_target", None)
+                or getattr(provider, "_routing_target", None)
+                or getattr(provider, "routing_target", None)
+            )
+            if routing_target:
+                span.set_attribute(ATTR_ROUTING_TARGET, str(routing_target))
+
+            routing_reason = (
+                getattr(target_provider, "_routing_reason", None)
+                or getattr(target_provider, "routing_reason", None)
+                or getattr(provider, "_routing_reason", None)
+                or getattr(provider, "routing_reason", None)
+            )
+            if routing_reason:
+                span.set_attribute(ATTR_ROUTING_REASON, str(routing_reason))
 
             max_tokens = getattr(request, "max_tokens", None)
             if max_tokens is not None:
