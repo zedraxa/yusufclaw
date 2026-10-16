@@ -7,6 +7,7 @@ import pytest
 import yusufclaw.gateway as gateway
 import yusufclaw.memory as memory
 import yusufclaw.queue as queue_pkg
+import yusufclaw.roles as roles
 import yusufclaw.routines as routines
 import yusufclaw.security as security
 import yusufclaw.skills as skills
@@ -21,6 +22,7 @@ def test_subpackages_docstrings() -> None:
     subpackages = [
         gateway,
         memory,
+        roles,
         routines,
         security,
         skills,

@@ -358,6 +358,36 @@ def create_app(
                     items = []
         return JSONResponse(status_code=200, content=items)
 
+    @app.get("/api/roles")
+    async def get_roles(request: Request) -> JSONResponse:
+        """List specialist agent roles with capability matrices and A2A cards."""
+        _verify_auth(request)
+        from yusufclaw.roles import get_role_catalog
+
+        catalog = get_role_catalog()
+        roles_data = [
+            {
+                "roleId": r.role_id,
+                "name": r.name,
+                "description": r.description,
+                "aliases": r.aliases,
+                "modelTier": r.model_tier,
+                "riskLevel": r.risk_level,
+                "allowedTools": r.allowed_tools,
+                "allowedMcpServers": r.allowed_mcp_servers,
+                "skills": r.skills,
+                "memoryScopes": r.memory_scopes.model_dump(),
+                "approvalActions": r.approval_actions,
+                "budgetLimits": r.budget_limits.model_dump(),
+                "sandboxRequired": r.sandbox_required,
+                "sandboxMode": r.sandbox_mode,
+                "sendChannels": r.send_channels,
+                "a2aCard": r.to_a2a_card().model_dump(),
+            }
+            for r in catalog.list_roles()
+        ]
+        return JSONResponse(status_code=200, content=roles_data)
+
     async def _parse_chat_body(request: Request) -> ChatMessageInput:
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
         if content_type != "application/json":
@@ -547,6 +577,22 @@ def create_app(
                 "connected",
                 {"status": "connected", "service": "yusufclaw", "user_id": user_id},
             )
+            try:
+                from yusufclaw.roles import get_role_catalog
+
+                catalog = get_role_catalog()
+                roles_summary = [
+                    {
+                        "roleId": r.role_id,
+                        "name": r.name,
+                        "modelTier": r.model_tier,
+                        "riskLevel": r.risk_level,
+                    }
+                    for r in catalog.list_roles()
+                ]
+                yield format_sse_event("roles", {"roles": roles_summary})
+            except Exception:
+                pass
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
