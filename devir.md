@@ -598,3 +598,44 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
   - `uv run mypy src`: 60 kaynak dosyasında tam strict modda 0 hata.
 - **Kılavuz Belgesi**: `PY-MCP.md`.
+
+---
+
+## 14. Rol Tabanlı Adaptif Model Yönlendirme (Model Router) — `py-routing` Dalı
+
+### 14.1 Genel Mimari ve Kararlar
+- `docs/ARCHITECTURE-v2.md` Katman 2 (Meta-orchestrator: model routing: strong model for planning/synthesis, cheap/local Ollama for classify/search/transform) ve `PY-ORCH.md` hedefleri doğrultusunda, tek sağlayıcıya bağımlı orkestrasyon hattı rol tabanlı çoklu model yönlendirme mimarisine yükseltilmiştir.
+- **Kapsam ve İzolasyon Güvencesi**:
+  - Kesinlikle dokunulmayan modüller: `gateway/`, `security/`, `memory/`, `mcp/`, `sandbox/`, `skills/lifecycle.py`, `routines/`, `infra_py/` ve `packages/` (TypeScript).
+  - Katkılar `src/yusufclaw/models/` altında modüler olarak eklenmiş (`router.py`, `__init__.py`), `src/yusufclaw/telemetry/` içine OTel yönlendirme semantikleri işlenmiş, `src/yusufclaw/orchestration/` ve `src/yusufclaw/agent.py` içine ise geriye dönük %100 uyumlu hafif kancalar (light hooks) yerleştirilmiştir.
+- **Offline ve Deterministik Çalışma Güvencesi**:
+  - Tek sağlayıcılı geriye dönük uyumluluk ve basamaklı geri çekilme (cascade fallback): Ortamda yalnızca tek bir `FakeProvider` yapılandırıldığında router tüm roller için otomatik ve hatasız olarak bu sağlayıcıya döner.
+  - Harici ağ, AWS bağlantısı veya API anahtarı gerektirmeden CI/test ortamlarında %100 offline çalışır.
+
+### 14.2 Gerçekleştirilen Bileşenler
+1. **İşlevsel Roller ve Yönlendirme Yapılandırması (`src/yusufclaw/models/router.py`)**:
+   - `ModelRole` (`StrEnum`): `planner`, `synthesis`, `judge`, `classify`, `search`, `transform`, `heuristic-assist`, `default`, `strong`, `cheap`.
+   - `RoutingConfig`: Rollerin sağlayıcı isimlerine eşlenmesi (`role_routes`), güçlü ve ucuz sağlayıcı takma adları (`strong_provider="strong"`, `cheap_provider="cheap"`), basit ve düşük riskli görevlerde ucuz sağlayıcıyı doğrudan tercih etme bayrağı (`prefer_cheap_for_simple`), ve ortam değişkenlerinden otomatik yükleme (`RoutingConfig.from_env()`, `YC_ROUTING_*`).
+   - `ModelRouter`: Çoklu sağlayıcı kayıt yöneticisi (`register_provider`, `set_route`), görev analizi (`TaskAnalysis`) odaklı dinamik rol kaydırma, basamaklı çözümleme (mapped role -> provider alias -> default -> sole provider fallback), `ModelProvider` polimorfizmi (`router.complete(req)`).
+2. **Orkestrasyon Entegrasyonu (`src/yusufclaw/orchestration/`)**:
+   - `TaskAnalyzer`: Model destekli görev sınıflandırmasında (`analyze_model`) güçlü model yerine ucuz/yerel sınıflandırıcı (`ModelRole.CLASSIFY`) sağlayıcısını kullanır; pahalı model token tüketimini önler.
+   - `Verifier`: Model hakemi değerlendirmesinde (`_evaluate_model_judge`) yüksek muhakeme gücüne sahip güçlü modeli (`ModelRole.JUDGE`) kullanır.
+   - `PlanAndExecuteWorkflow`: Plan üretimi (`_generate_model_plan`) ve nihai sentez (`synthesizer_node`) aşamalarında güçlü modeli (`ModelRole.PLANNER` ve `ModelRole.SYNTHESIS`), adımların doğrudan yürütülmesinde `ModelRole.DEFAULT`, başarısız adım telafisinde ise `ModelRole.STRONG` kullanır.
+   - `SubagentRunner`: Alt ajanlar `spec.model_role` alanı üzerinden router ile dinamik sağlayıcı çözümler.
+   - `AdaptiveOrchestrator`: Tüm orkestrasyon yaşam döngüsünü router ile koordine eder. Görev karmaşıklığı basit (`complexity=simple`) ve risk düşük (`risk=low`) olduğunda, doğrudan dönüşü ucuz sağlayıcıya yönlendirir (`routed_direct_provider`). Doğrulama başarısızlığında 1-turluk telafiyi güçlü sağlayıcıya devreder.
+   - `Agent` (`src/yusufclaw/agent.py`): `AgentState` içine `active_provider` alanı eklenerek doğrudan dönüş çağrılarının yönlendirilen sağlayıcıyla yürütülmesi sağlandı; geriye dönük uyumluluk korundu.
+3. **OpenTelemetry İzleme Semantikleri (`src/yusufclaw/telemetry/`)**:
+   - Nitelikler: `yusufclaw.routing.role`, `yusufclaw.routing.provider`, `yusufclaw.routing.target`, `yusufclaw.routing.reason`.
+   - Yardımcı: `record_routing_decision(span, role, provider_name, target, reason)`.
+   - `yusufclaw.orchestration.task_analysis`, `plan_generation`, `synthesis`, `verification`, `turn` ve `subagent` span'ları yönlendirme nitelikleriyle zenginleştirildi.
+
+### 14.3 Test ve Doğrulama
+- **Eklenen Test Dosyası**:
+  - `tests/python/test_routing.py` (19 senaryo: rol enum ve varsayılan eşlemeler, env parsing, güçlü/ucuz rol seçimi, tek sağlayıcı basamaklı geri çekilme, eksik sağlayıcı toleransı, dinamik sağlayıcı kaydı ve rota güncelleme, TaskAnalysis odaklı ucuz yol seçimi, TaskAnalyzer sınıflandırma izolasyonu, Verifier hakem izolasyonu, Planner ve Synthesizer güçlü model ayrımı, AdaptiveOrchestrator çoklu sağlayıcı tam turu ve ucuz doğrudan yol, Agent entegrasyonu, OpenTelemetry span nitelik doğrulaması).
+- **Sonuçlar**:
+  - `uv run pytest`: **158 passed, 1 skipped** (21.02s, 22 test dosyasında 159 test, %100 yeşil).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 69 kaynak dosyasında tam strict modda 0 hata (`Success: no issues found in 69 source files`).
+  - Yasaklı dizinler (`gateway/`, `security/`, `memory/`, `mcp/`, `sandbox/`, `skills/lifecycle.py`, `routines/`, `infra_py/`, `packages/`) tertemiz korunmuştur.
+- **Kılavuz Belgesi**: `PY-ROUTING.md`.
+
