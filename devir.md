@@ -135,10 +135,10 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - `uv run yusufclaw turn "Hello" --provider fake`: CLI üzerinden LangGraph döngüsü başarıyla test edilmiştir.
 
 ### 5.4 Sonraki Adımlar
-- TypeScript testlerinden güvenlik kurallarını ve taint tracking mantığını Python'a taşımak (`src/yusufclaw/security/`).
-- `packages/core/src/memory.ts` içindeki SQLite FTS5 yapılandırılmış bellek mantığını Python'a taşımak (`src/yusufclaw/memory/`) [TAMAMLANDI].
-- Araç katmanını (shell sandbox, files, fetch) taşımak (`src/yusufclaw/tools/`).
-- Telegram botu ve web AG-UI event stream mekanizmasını bağlamak.
+- TypeScript testlerinden güvenlik kurallarını ve taint tracking mantığını Python'a taşımak (`src/yusufclaw/security/`) [TAMAMLANDI — bkz. bölüm 7].
+- `packages/core/src/memory.ts` içindeki SQLite FTS5 yapılandırılmış bellek mantığını Python'a taşımak (`src/yusufclaw/memory/`) [TAMAMLANDI — bkz. bölüm 6].
+- Araç katmanını (shell sandbox, files, fetch) taşımak (`src/yusufclaw/tools/`) [TAMAMLANDI — bkz. bölüm 7].
+- Telegram botu ve web AG-UI event stream mekanizmasını bağlamak (`py-gateway`).
 
 ---
 
@@ -179,3 +179,68 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check`: 0 uyarı/hata.
   - `uv run mypy src tests/python`: 33 kaynak dosyasında strict tip denetimi 0 hata ile geçti.
   - `packages/` (TypeScript), `src/yusufclaw/security/`, `src/yusufclaw/tools/` ve AWS yapılandırmalarına dokunulmadı.
+
+## 7. Python Güvenlik Alt Sistemi (Security Sprint Portu: YC-01, YC-02, YC-03, YC-05, YC-10) — `py-security` Dalı
+
+### 7.1 Genel Mimari ve Kararlar
+- TypeScript `phase3-security` dalında uygulanan güvenlik sprinti, Python 3.12, Pydantic v2 ve LangGraph mimarisiyle %100 uyumlu olarak `src/yusufclaw/security`, `src/yusufclaw/tools` ve `evals/` altına taşınmıştır.
+- `packages/` (TypeScript) dizinine ve başka bir ajan tarafından üzerinde çalışılan `src/yusufclaw/memory` dizinine **kesinlikle dokunulmamıştır**.
+- AWS altyapısına dokunulmamış; tüm testler ve değerlendirmeler tamamen offline olarak çalıştırılmıştır.
+
+### 7.2 Gerçekleştirilen Bileşenler
+1. **Pydantic Güvenlik Modelleri (`src/yusufclaw/security/models.py`)**:
+   - `Label` (`origin`, `integrity: 'trusted' | 'untrusted'`, `secrecy: 'public' | 'private' | 'secret'`) ve `Value[T]`.
+   - `SessionTaint` (`contaminated`, `sources`).
+   - `ToolManifest` (`id`, `version`, `source`, `effects`, `resources`, `description_sha256`).
+   - `ActionCard` ve `ActionCardRendered` (`approval_id`, `nonce`, `expires_at`, `tool_id`, `tool_version`, `args_sha256`, `rendered`).
+   - `PolicyDecision` (`allow`, `deny`, `card`) ve `ConsumeResult`.
+2. **Deterministik Politika Motoru (`src/yusufclaw/security/engine.py`)**:
+   - `canonical_json`: RFC 8785 ve TypeScript implementasyonu ile birebir uyumlu sıralı, kompakt JSON serileştiricisi.
+   - `Grants`: Monotonik yetki denetimi (`allowed_tools`, `allowed_hosts`, `allowed_paths`).
+   - `render_card`: Gerçek araç argümanlarından deterministik insan-onay kartı üretimi.
+   - `decide`: Monotonik Grants kontrolü -> Gizli etiketli verilerin `egress` ile çıkışının engellenmesi (FIDES) -> Kirlenmiş oturumda `egress`/`send_message`/`spend`/`exec` etkileri için zorunlu ActionCard (Willison Lethal Trifecta) -> Güvenilmeyen kaynaktan gelen hassas parametreler için ActionCard -> İzin (`allow`).
+3. **ActionCard Yaşam Döngüsü ve Saklama (`src/yusufclaw/security/cards.py`)**:
+   - `ActionCardStore`:
+     - 16 baytlık kriptografik rastgele hex `nonce`.
+     - 5 dakikalık TTL (`expires_at`).
+     - Kanonik JSON SHA-256 argüman özeti doğrulaması (`args_sha256`).
+     - Atomik tek seferlik tüketim (`consume`): Tekrar oynatma (*replay attack*) denemeleri anında reddedilir.
+     - Argüman değişikliği engelleme: Tüketim sırasında sunulan argümanların özeti uyuşmazsa işlem reddedilir.
+     - `deny`: Kartın reddedilmesi ve bir daha tüketilememesi.
+4. **Telegram Onay Kartları ve Rıza Bütünlüğü (`src/yusufclaw/security/telegram.py`, `src/yusufclaw/gateway/telegram.py`)**:
+   - `format_telegram_card_message`: Ajanın serbest metninden kesinlikle üretilmez (Consent Integrity / VAC); doğrudan kart verisinden formatlanır. Ajan iddiası yalnızca güvenilmeyen açıklama olarak ayrıştırılmış blokta sunulur.
+   - `build_telegram_card_keyboard`: `approve:<id>:<nonce>`, `deny:<id>:<nonce>`, `details:<id>:<nonce>` inline buton verileri.
+   - `handle_telegram_callback_data`: Kullanıcı allowlist, tekrar oynatma ve argüman sahteciliği denetimi.
+5. **Güvenlik Korumalı Araçlar (`src/yusufclaw/tools/`)**:
+   - `files.py`: `DEFAULT_WORKSPACE_DIR` (`.data/workspace`), `is_restricted_secret_path` (.env*, *.sqlite*, ~/.aws*, .git/config, id_rsa, id_ed25519), `resolve_safe_path` (symlink kaçış koruması, ata dizin doğrulaması, boş bayt engeli), `file_read`, `file_write` (onaylı), `file_list`.
+   - `fetch.py`: `is_blocked_hostname`, `is_blocked_ip` (loopback, private RFC1918, link-local, CGNAT `100.64.0.0/10`, multicast, dokümantasyon IP'leri, IPv4-mapped IPv6, metadata IP'leri), `validate_host_ssrf` (DNS çözümlemesi sonrası IP denetimi), `web_fetch` (manuel redirect döngüsü ile her yönlendirme hedefinde SSRF doğrulaması).
+   - `shell.py`: `contains_restricted_path` (`cat ../.env` ve traversal tespiti), `extract_command_binaries`, `is_dangerous_command`, `create_shell_tool` (allowlist, tehlikeli komut onayı, cwd sınırlaması, temiz ortam değişkenleri).
+   - `time.py`: `current_time` salt-okur zaman aracı.
+6. **LangGraph Ajan Döngüsü Güvenlik Entegrasyonu (`src/yusufclaw/agent.py`)**:
+   - Oturum bazlı `SessionTaint` takibi (`get_taint`, `set_taint`).
+   - Araç çağrısı öncesinde `decide()` politikası değerlendirmesi.
+   - `read_untrusted` etkisi taşıyan araç çalıştığında oturumun kirlenmesi (`contaminated = True`).
+   - `/reset` komutunda oturum turn ve taint durumunun sıfırlanması.
+7. **Güvenlik Değerlendirme Koşucusu ve CI Fikstürleri (`evals/`, `scripts/run_evals.py`)**:
+   - 12 adet YAML saldırı ve zararsız fikstürünün eksiksiz portu (`evals/fixtures/`).
+   - `EvalRunner`: Sahte model sağlayıcı, izole geçici çalışma alanı ve mock ağ katmanı ile senaryoları çalıştıran deterministik değerlendirme motoru.
+   - `scripts/run_evals.py`: Komut satırından ASR ve zararsız başarı oranını tablo halinde basan script.
+   - `tests/python/test_evals.py`: Pytest entegrasyonu.
+
+### 7.3 Test ve Doğrulama
+- **Pytest**: **46 testin tamamı** yeşil geçti (`uv run pytest`, 3.82s).
+- **Ruff**: 0 hata (`uv run ruff check` -> `All checks passed!`).
+- **Mypy**: 0 hata (`uv run mypy src` -> `Success: no issues found in 29 source files`).
+- **Güvenlik Değerlendirme Raporu (`uv run python scripts/run_evals.py`)**:
+  - **Toplam Senaryo:** 12
+  - **Saldırı Senaryosu:** 8
+  - **Saldırı Başarı Oranı (ASR):** %0.00 (Hedef: %0.00, 8 saldırının 0'ı başarılı oldu).
+  - **Zararsız Senaryo:** 4
+  - **Zararsız Görev Başarı Oranı:** %100.00 (Hedef: %100.00).
+  - **Üretilen ActionCard Sayısı:** 5
+- **Dokunulmayan Alanlar:** `packages/` ve `src/yusufclaw/memory` %100 temiz ve dokunulmamıştır.
+
+### 7.4 Sonraki Adımlar
+- Bellek araçlarını `read_private` etkisiyle güvenlik döngüsüne bağlamak (memory + security birleşik `agent.py` hazır; etki etiketleri sıkılaştırılabilir).
+- Telegram gateway long-polling canlı döngüsünü bağlamak.
+- Kılavuz belgesi: `PY-SECURITY.md`.

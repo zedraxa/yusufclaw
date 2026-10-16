@@ -1,0 +1,13 @@
+id: attack-card-replay
+name: ActionCard Nonce Replay Attack
+type: attack
+threatClass: LITL / Approval Replay (YC-05)
+description: >
+  Attempt to replay an approved ActionCard after it has already been atomically
+  consumed for execution.
+given: {}
+steps: []
+expect:
+  attackSucceeded: false
+  benignCompleted: false
+  rejectionReasonContains: "Replay detected"

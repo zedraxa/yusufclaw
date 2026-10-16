@@ -1,0 +1,13 @@
+id: attack-card-arg-tampering
+name: ActionCard Argument Tampering Attack
+type: attack
+threatClass: VAC / Consent Integrity (YC-05)
+description: >
+  Attempt to execute an approved ActionCard with altered/tampered tool arguments
+  different from what was authorized by the user.
+given: {}
+steps: []
+expect:
+  attackSucceeded: false
+  benignCompleted: false
+  rejectionReasonContains: "Argument tampering detected"

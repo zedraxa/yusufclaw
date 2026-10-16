@@ -1,11 +1,14 @@
-"""Minimal LangGraph agent loop for YusufClaw.
+"""Minimal LangGraph agent loop for YusufClaw with security policies and memory.
 
 Defines a clean interface over a LangGraph state machine consisting of:
-- AgentState: holds message history and step count.
+- AgentState: holds message history, step count, and session context.
 - model_node: executes provider completion with system prompt, memory context, and available tools.
-- tool_node: invokes tool handlers for any requested tool calls.
+- tool_node: evaluates deterministic security policies, tracks session taints,
+  manages human-in-the-loop ActionCard approvals, and invokes tool handlers.
 - conditional edge: determines whether to continue executing tools or end the turn.
 """
+
+from __future__ import annotations
 
 import inspect
 import uuid
@@ -25,8 +28,21 @@ from yusufclaw.models.types import (
     ToolCall,
     ToolDefinition,
 )
+from yusufclaw.security import (
+    ActionCard,
+    ActionCardStore,
+    Grants,
+    Label,
+    SessionTaint,
+    ToolManifest,
+    Value,
+    decide,
+    render_card,
+)
+from yusufclaw.tools.manifest import GuardedTool
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]
+ApproveCallback = Callable[[ToolCall, ActionCard | None], Awaitable[bool]]
 
 
 class AgentState(TypedDict):
@@ -38,7 +54,7 @@ class AgentState(TypedDict):
 
 
 class Agent:
-    """Core agent loop wrapping a compiled LangGraph state graph."""
+    """Core agent loop wrapping a compiled LangGraph state graph with security policies."""
 
     def __init__(
         self,
@@ -48,6 +64,9 @@ class Agent:
         tools: Sequence[ToolDefinition] | None = None,
         tool_executor: ToolExecutor | None = None,
         max_steps: int = 8,
+        grants: Grants | None = None,
+        card_store: ActionCardStore | None = None,
+        approve_callback: ApproveCallback | None = None,
     ) -> None:
         if isinstance(memory, str):
             system_prompt = memory
@@ -59,6 +78,10 @@ class Agent:
         self.tools = list(tools) if tools else []
         self.tool_executor = tool_executor
         self.max_steps = max_steps
+        self.grants = grants
+        self.card_store = card_store or ActionCardStore()
+        self.approve_callback = approve_callback
+        self.taints: dict[str, SessionTaint] = {}
 
         self._memory_tools_map: dict[str, MemoryTool] = {}
         if self.memory is not None:
@@ -68,7 +91,21 @@ class Agent:
                 if not any(t.name == mt.name for t in self.tools):
                     self.tools.append(mt)
 
+        self.tools_by_name: dict[str, ToolDefinition] = {t.name: t for t in self.tools}
         self.graph = self._build_graph()
+
+    def get_taint(self, session_id: str) -> SessionTaint:
+        """Get or initialize the taint state for a session."""
+        if session_id not in self.taints:
+            self.taints[session_id] = SessionTaint(contaminated=False, sources=[])
+        return self.taints[session_id]
+
+    def set_taint(self, session_id: str, taint: SessionTaint) -> None:
+        """Set the taint state for a session."""
+        self.taints[session_id] = SessionTaint(
+            contaminated=taint.contaminated,
+            sources=list(taint.sources),
+        )
 
     def _convert_to_model_messages(self, messages: list[BaseMessage]) -> list[Message]:
         converted: list[Message] = []
@@ -171,24 +208,141 @@ class Agent:
             last = state["messages"][-1]
             tool_calls = getattr(last, "tool_calls", [])
             results: list[ToolMessage] = []
+            session_id = state.get("session_id", "default")
+            taint = self.get_taint(session_id)
 
             for call in tool_calls:
                 call_id = call.get("id") or str(uuid.uuid4())
                 name = call.get("name", "")
                 args = call.get("args", {})
+                tool_def = self.tools_by_name.get(name)
 
+                # Memory tools: execute directly (trusted, no egress)
                 if name in self._memory_tools_map:
                     try:
                         output = await self._memory_tools_map[name].execute(args)
                     except Exception as e:
                         output = f"Tool execution error: {e}"
-                elif self.tool_executor:
-                    try:
-                        output = await self.tool_executor(name, args)
-                    except Exception as e:
-                        output = f"Tool execution error: {e}"
+                    results.append(
+                        ToolMessage(
+                            content=output,
+                            tool_call_id=call_id,
+                            name=name,
+                        )
+                    )
+                    continue
+
+                # 1. Unknown tool check
+                if tool_def is None and self.tool_executor is None:
+                    results.append(
+                        ToolMessage(
+                            content="Unknown tool",
+                            tool_call_id=call_id,
+                            name=name,
+                        )
+                    )
+                    continue
+
+                # 2. Extract manifest
+                manifest: ToolManifest
+                if isinstance(tool_def, GuardedTool):
+                    manifest = tool_def.manifest
                 else:
-                    output = f"Executed {name} with args {args}"
+                    manifest = ToolManifest(
+                        id=name,
+                        version="1.0.0",
+                        source="builtin",
+                        effects=[],
+                    )
+
+                # 3. Security Label and Value wrapper
+                args_value = Value[dict[str, Any]](
+                    v=args,
+                    labels=[
+                        Label(
+                            origin="agent",
+                            integrity="untrusted" if taint.contaminated else "trusted",
+                            secrecy="public",
+                        )
+                    ],
+                )
+
+                # 4. Evaluate deterministic security policy
+                decision = decide(manifest, args_value, taint, self.grants)
+                if decision.kind == "deny":
+                    results.append(
+                        ToolMessage(
+                            content=f"Tool policy denied: {decision.reason}",
+                            tool_call_id=call_id,
+                            name=name,
+                        )
+                    )
+                    continue
+
+                # 5. Check if human-in-the-loop ActionCard approval is required
+                needs_approval = False
+                action_card: ActionCard | None = None
+
+                if decision.kind == "card":
+                    needs_approval = True
+                    action_card = decision.card
+                elif isinstance(tool_def, GuardedTool) and tool_def.check_approval(args):
+                    needs_approval = True
+                    action_card = render_card(manifest, args_value, taint)
+
+                if needs_approval:
+                    if action_card is not None and self.card_store is not None:
+                        self.card_store.register(action_card, expected_args=args)
+
+                    approved = False
+                    if self.approve_callback is not None:
+                        try:
+                            tc_obj = ToolCall(id=call_id, name=name, input=args)
+                            approved = await self.approve_callback(tc_obj, action_card)
+                        except Exception:
+                            approved = False
+
+                    if not approved:
+                        results.append(
+                            ToolMessage(
+                                content="Tool approval denied",
+                                tool_call_id=call_id,
+                                name=name,
+                            )
+                        )
+                        continue
+
+                # 6. Tool execution
+                try:
+                    if isinstance(tool_def, GuardedTool):
+                        output = await tool_def.execute(args)
+                    elif self.tool_executor:
+                        output = await self.tool_executor(name, args)
+                    else:
+                        output = f"Executed {name} with args {args}"
+
+                    # 7. Update taint if tool ingested untrusted data
+                    if "read_untrusted" in manifest.effects:
+                        taint.contaminated = True
+                        if name not in taint.sources:
+                            taint.sources.append(name)
+                except Exception as e:
+                    err_msg = str(e)
+                    if any(
+                        kw in err_msg
+                        for kw in (
+                            "restricted sensitive path",
+                            "restricted sensitive file",
+                            "SSRF",
+                            "outside workspace",
+                            "allowlist",
+                            "Tool policy denied",
+                            "Tool approval denied",
+                        )
+                    ):
+                        output = err_msg
+                    else:
+                        output = f"Tool execution error: {err_msg}"
 
                 results.append(
                     ToolMessage(
@@ -209,13 +363,28 @@ class Agent:
 
         return workflow.compile()
 
-    async def run(self, prompt: str, session_id: str = "default") -> str:
+    async def run(
+        self,
+        prompt: str,
+        session_id: str = "default",
+        approve_callback: ApproveCallback | None = None,
+    ) -> str:
         """Run a single conversational turn and return the final assistant response."""
-        state = await self.run_state(prompt, session_id=session_id)
-        for msg in reversed(state["messages"]):
-            if isinstance(msg, AIMessage):
-                return str(msg.content)
-        return ""
+        if prompt.strip() == "/reset":
+            self.taints.pop(session_id, None)
+            return "Conversation cleared."
+
+        original_cb = self.approve_callback
+        if approve_callback is not None:
+            self.approve_callback = approve_callback
+        try:
+            state = await self.run_state(prompt, session_id=session_id)
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage):
+                    return str(msg.content)
+            return ""
+        finally:
+            self.approve_callback = original_cb
 
     async def run_state(self, prompt: str, session_id: str = "default") -> AgentState:
         """Run a conversational turn and return the final LangGraph state."""
@@ -242,6 +411,7 @@ class Agent:
 
             # Local commands
             if clean == "/reset":
+                self.taints.pop(session, None)
                 if self.memory is not None:
                     clear_fn = getattr(self.memory, "clear", None)
                     if clear_fn:
@@ -282,12 +452,18 @@ class Agent:
                         elif role == "assistant":
                             history_messages.append(AIMessage(content=str(content)))
 
-            initial_state: AgentState = {
-                "messages": [*history_messages, HumanMessage(content=text)],
-                "step_count": 0,
-                "session_id": session,
-            }
-            final_state: AgentState = await self.graph.ainvoke(initial_state)
+            original_cb = self.approve_callback
+            if approve is not None:
+                self.approve_callback = approve
+            try:
+                initial_state: AgentState = {
+                    "messages": [*history_messages, HumanMessage(content=text)],
+                    "step_count": 0,
+                    "session_id": session,
+                }
+                final_state: AgentState = await self.graph.ainvoke(initial_state)
+            finally:
+                self.approve_callback = original_cb
 
             final_reply = ""
             for msg in reversed(final_state["messages"]):
@@ -311,4 +487,4 @@ class Agent:
             return final_reply
 
 
-__all__ = ["Agent", "AgentState", "ToolExecutor"]
+__all__ = ["Agent", "AgentState", "ApproveCallback", "ToolExecutor"]
