@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.20.0",
     "boto3>=1.34.0",
+    "deepagents>=0.7.26",
     "fastapi>=0.111.0",
     "greenlet>=3.0.0",
     "httpx>=0.27.0",
