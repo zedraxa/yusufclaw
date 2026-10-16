@@ -36,7 +36,12 @@ def test_bubblewrap_command_construction() -> None:
     )
     cmd = runner.build_command("echo 'hello'", cfg)
 
-    assert "bwrap" in cmd[0]
+    assert any("bwrap" in part for part in cmd)
+    assert "MemoryMax=512M" in cmd
+    assert "CPUQuota=100%" in cmd
+    assert "--unshare-user" in cmd
+    assert "--clearenv" in cmd
+    assert "--remount-ro" in cmd
     assert "--unshare-net" in cmd
     assert "--tmpfs" in cmd
     assert "/tmp" in cmd
@@ -179,3 +184,168 @@ def test_reversible_action_log_lifecycle(tmp_path: Path) -> None:
     # Verify log entries preserved in append-only JSONL
     entries = action_log.get_entries()
     assert len(entries) >= 4
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".ssh/key",
+        ".env",
+        ".env.production",
+        ".aws/config",
+        ".azure/token",
+        ".config/gcloud/token",
+        "agent-data/log",
+        "id_ed25519",
+        "db.sqlite3",
+        "credentials.json",
+    ],
+)
+def test_secret_mount_denial(tmp_path: Path, name: str) -> None:
+    secret = tmp_path / name
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("secret")
+    for runner in (
+        BubblewrapRunner(),
+        RootlessContainerRunner("podman"),
+        RootlessContainerRunner("docker"),
+    ):
+        with pytest.raises(ValueError, match="denied secret"):
+            runner.build_command("cat *", SandboxConfig(workspace_dir=str(tmp_path)))
+        with pytest.raises(ValueError):
+            runner.build_command("true", SandboxConfig(read_only_binds=[str(tmp_path)]))
+
+
+@pytest.mark.parametrize(
+    "field", ["memory_limit_mb", "cpu_limit", "timeout_seconds", "max_output_bytes"]
+)
+def test_invalid_limits(field: str) -> None:
+    with pytest.raises(ValueError):
+        SandboxConfig.model_validate({field: 0})
+
+
+def test_link_denial(tmp_path: Path) -> None:
+    (tmp_path / "alias").symlink_to("/etc/passwd")
+    with pytest.raises(ValueError, match="symlink"):
+        BubblewrapRunner().build_command("true", SandboxConfig(workspace_dir=str(tmp_path)))
+
+
+def test_runtime_rootless_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    from subprocess import CompletedProcess
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/" + name)
+    for runtime, info, expected in [
+        ("docker", {}, False),
+        ("podman", {"host": {"security": {"rootless": False}}}, False),
+        ("podman", {"host": {"security": {"rootless": True}, "cgroupVersion": "v2"}}, True),
+        (
+            "docker",
+            {"SecurityOptions": ["name=rootless"], "CgroupVersion": "2", "CgroupDriver": "systemd"},
+            True,
+        ),
+    ]:
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, info=info, **kwargs: CompletedProcess([], 0, json.dumps(info)),
+        )
+        assert RootlessContainerRunner(runtime).is_available() is expected
+
+
+def test_no_runtime_and_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    runner = get_sandbox_runner()
+    cfg = SandboxConfig(
+        workspace_dir=str(tmp_path / "work"), action_log_path=str(tmp_path / "audit")
+    )
+    result = runner.run("touch escaped", cfg)
+    assert result.exit_code == 126
+    assert not (tmp_path / "work" / "escaped").exists()
+    entries = ReversibleActionLog(cfg.action_log_path).get_entries()
+    assert [e.action_type for e in entries] == ["sandbox_intent", "sandbox_result"]
+    assert entries[-1].status == "failed"
+    assert all(not e.reversible for e in entries)
+    assert entries[0].details["run_id"] == entries[1].details["run_id"]
+
+
+async def test_shell_uses_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yusufclaw.sandbox.models import SandboxResult
+    from yusufclaw.tools.shell import create_shell_tool
+
+    class FakeRunner:
+        async def run_async(self, command: str, config: SandboxConfig) -> SandboxResult:
+            assert "python3 -c" in command
+            assert config.workspace_dir == str(tmp_path)
+            assert not config.allow_network
+            return SandboxResult(
+                exit_code=0, stdout="isolated", stderr="", duration_seconds=0, backend="fake"
+            )
+
+    monkeypatch.setattr("yusufclaw.tools.shell.get_sandbox_runner", lambda: FakeRunner())
+    tool = create_shell_tool(str(tmp_path))
+    assert await tool.execute_fn({"command": "python3 -c 'print(1)'"}) == "isolated"
+
+
+@pytest.mark.parametrize("command,code", [("printf success", 0), ("exit 7", 7), ("sleep 10", 124)])
+def test_execution_audit_and_timeout(tmp_path: Path, command: str, code: int) -> None:
+    from yusufclaw.sandbox.runner import SandboxRunner
+
+    class TestRunner(SandboxRunner):
+        name = "test-only"
+
+        def is_available(self) -> bool:
+            return True
+
+        def build_command(self, command: str | list[str], config: SandboxConfig) -> list[str]:
+            assert isinstance(command, str)
+            return ["/bin/sh", "-c", command]
+
+    cfg = SandboxConfig(
+        workspace_dir=str(tmp_path / "work"),
+        action_log_path=str(tmp_path / "audit"),
+        timeout_seconds=0.1,
+    )
+    result = TestRunner().run(command, cfg)
+    assert result.exit_code == code
+    assert result.timed_out == (code == 124)
+    entries = ReversibleActionLog(cfg.action_log_path).get_entries()
+    assert len(entries) == 2
+    assert entries[-1].details["exit_code"] == code
+    assert entries[-1].status == ("executed" if code == 0 else "failed")
+
+
+def test_log_not_exposed(tmp_path: Path) -> None:
+    cfg = SandboxConfig(workspace_dir=str(tmp_path), action_log_path=str(tmp_path / "log"))
+    with pytest.raises(ValueError, match="outside"):
+        RootlessContainerRunner().build_command("true", cfg)
+
+
+async def test_cancellation_is_audited(tmp_path: Path) -> None:
+    import asyncio
+
+    from yusufclaw.sandbox.runner import SandboxRunner
+
+    started = asyncio.Event()
+
+    class TestRunner(SandboxRunner):
+        name = "test-only"
+
+        def is_available(self) -> bool:
+            return True
+
+        def build_command(self, command: str | list[str], config: SandboxConfig) -> list[str]:
+            started.set()
+            return ["/bin/sh", "-c", "sleep 10"]
+
+    cfg = SandboxConfig(
+        workspace_dir=str(tmp_path / "work"), action_log_path=str(tmp_path / "audit")
+    )
+    task = asyncio.create_task(TestRunner().run_async("test", cfg))
+    await started.wait()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    entries = ReversibleActionLog(cfg.action_log_path).get_entries()
+    assert entries[-1].details["exit_code"] == 130
+    assert entries[-1].status == "failed"

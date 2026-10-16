@@ -906,3 +906,12 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - Doğrulama: `uv run pytest -q` → **228 passed, 1 skipped**; `uv run ruff check .` → temiz; `uv run mypy src` → **82 dosyada hata yok**.
 - Kullanım ve sınırlar: `docs/PY-MEMCONS.md`. İş kapsam başına tek yazıcıyla, en fazla 200 aktif kayıt üzerinde çalışır; otomatik zamanlama/agent entegrasyonu eklenmedi. Agent, models, gateway, roles, coordination ve queue değiştirilmedi. AWS kullanılmadı; push yapılmadı. §20 queue worker için ayrılmıştır; mevcut bölümler yeniden numaralandırılmadı.
 
+
+---
+
+## 23. Python Rootless Sandbox Sertleştirme — `py-sandbox` Dalı
+
+- Bubblewrap → rootless Podman → rootless Docker seçim sırası; varsayılan ağ kapalı, salt-okunur kök, açık workspace bind, CPU/bellek/süre/tasks limitleri, fail-closed (runtime yoksa 126). Gizli yollar (ssh, .env, cloud creds, agent-data) mount reddi; symlink/özel dosya reddi.
+- `shell` aracı sandbox runner'ı tercih eder; host shell'e düşmez. İptal/timeout süreç grubunu öldürür; konteyner cleanup denemesi audite yazılır.
+- `ReversibleActionLog`: intent+outcome (komut hash, backend, exit); ham komut/env/çıktı saklanmaz. Keyfi komutlar geri alınamaz olarak belgelenir.
+- Doğrulama: `uv run pytest -q` → **273 passed**; ruff temiz; mypy src (85 dosya) temiz. Mock/skip ile bwrap/podman gerekmez. Kullanım: `docs/PY-SANDBOX.md`. Agent/models/gateway/roles/queue/memory/evals değiştirilmedi. AWS yok; push yapılmadı. §22 evals için ayrılmıştır.
