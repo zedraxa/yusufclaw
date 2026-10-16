@@ -18,9 +18,13 @@ import hashlib
 import hmac
 import inspect
 import json
+import re
+import secrets
 import socket
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import uvicorn
@@ -29,10 +33,83 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from pydantic import BaseModel, ConfigDict, Field
 
 from yusufclaw import __version__
+from yusufclaw.agent import reset_turn_event_hook, set_turn_event_hook
 from yusufclaw.config import Settings, get_settings
+from yusufclaw.gateway.approval import (
+    ActionCard,
+    ActionCardRendered,
+    ApprovalProvider,
+    InMemoryApprovalProvider,
+)
 from yusufclaw.gateway.bus import IncomingMessage, MessageBus
 from yusufclaw.gateway.web_page import CHAT_PAGE, CHAT_SCRIPT, CHAT_STYLE
 from yusufclaw.telemetry import setup_telemetry
+
+SENSITIVE_KEY_SUBSTRINGS = {
+    "password",
+    "secret",
+    "token",
+    "key",
+    "auth",
+    "credential",
+    "credentials",
+    "api_key",
+    "apikey",
+    "access_token",
+    "private_key",
+    "webhook",
+    "bearer",
+}
+RE_BEARER = re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]+", re.IGNORECASE)
+RE_AWS_KEY = re.compile(r"AKIA[0-9A-Z]{16}")
+RE_GENERIC_KEY = re.compile(r"(?:(?:sk|ghp|gho|glpat|github_pat)[-_]|sk-proj-)[A-Za-z0-9_-]{16,}")
+RE_URL_CRED = re.compile(r"(https?://)([^:]+):([^@]+)@")
+
+
+def sanitize_secret_patterns(text: str) -> str:
+    """Mask credentials and secrets within freeform strings."""
+    t = RE_BEARER.sub("Bearer [REDACTED]", text)
+    t = RE_AWS_KEY.sub("[REDACTED_AWS_KEY]", t)
+    t = RE_GENERIC_KEY.sub("[REDACTED_TOKEN]", t)
+    t = RE_URL_CRED.sub(r"\1***:***@", t)
+    return t
+
+
+def sanitize_args_summary(args: Any) -> Any:
+    """Sanitize and truncate tool arguments to prevent credential or secret leaks."""
+    if isinstance(args, dict):
+        sanitized: dict[str, Any] = {}
+        for k, v in args.items():
+            k_str = str(k).lower()
+            if any(sub in k_str for sub in SENSITIVE_KEY_SUBSTRINGS):
+                sanitized[k] = "[REDACTED]"
+            elif isinstance(v, (dict, list)):
+                sanitized[k] = sanitize_args_summary(v)
+            elif isinstance(v, str):
+                s = sanitize_secret_patterns(v)
+                if len(s) > 300:
+                    s = s[:300] + "... (truncated)"
+                sanitized[k] = s
+            else:
+                sanitized[k] = v
+        return sanitized
+    if isinstance(args, list):
+        return [sanitize_args_summary(item) for item in args]
+    if isinstance(args, str):
+        s = sanitize_secret_patterns(args)
+        if len(s) > 300:
+            s = s[:300] + "... (truncated)"
+        return s
+    return args
+
+
+def sanitize_result_summary(result: Any) -> str:
+    """Sanitize and truncate tool execution result text."""
+    text = str(result)
+    cleaned = sanitize_secret_patterns(text)
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500] + "... (truncated)"
+    return cleaned
 
 
 class HealthResponse(BaseModel):
@@ -42,6 +119,26 @@ class HealthResponse(BaseModel):
     version: str
     service: str
     model_provider: str
+
+
+class ApprovalInput(BaseModel):
+    """Strict schema for incoming action card approval or denial decisions."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    approval_id: str = Field(min_length=1, max_length=128, alias="approvalId")
+    nonce: str = Field(min_length=1, max_length=128)
+    decision: Literal["approve", "deny"] = Field(default="approve")
+    action: Literal["approve", "deny"] | None = None
+    args: dict[str, Any] | None = None
+
+    @property
+    def approvalId(self) -> str:
+        return self.approval_id
+
+    @property
+    def resolved_action(self) -> Literal["approve", "deny"]:
+        return self.action or self.decision
 
 
 class ChatMessageInput(BaseModel):
@@ -125,6 +222,7 @@ def create_app(
     token: str | None = None,
     user_id: str = "local",
     settings: Settings | None = None,
+    approval_provider: ApprovalProvider | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI web gateway application."""
     actual_bus: MessageBus | None
@@ -140,6 +238,18 @@ def create_app(
         if auth_token
         else None
     )
+
+    active_approval_provider: ApprovalProvider
+    bus_agent = getattr(actual_bus, "agent", None) if actual_bus is not None else None
+    agent_store = getattr(bus_agent, "card_store", None)
+    if approval_provider is not None:
+        active_approval_provider = approval_provider
+    elif agent_store is not None and isinstance(agent_store, ApprovalProvider):
+        active_approval_provider = agent_store
+    else:
+        active_approval_provider = InMemoryApprovalProvider()
+
+    pending_approvals: dict[str, dict[str, Any]] = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Any:
@@ -267,6 +377,95 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail={"error": "Invalid message"}) from exc
 
+    async def _handle_approval_decision(request: Request) -> JSONResponse:
+        _verify_auth(request)
+
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid approval payload"}
+            ) from exc
+
+        try:
+            app_in = ApprovalInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid approval payload"}
+            ) from exc
+
+        app_id = app_in.approval_id
+        pending = pending_approvals.get(app_id)
+        record = active_approval_provider.get(app_id)
+
+        if pending is None:
+            if record and record.status in ("approved", "consumed"):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Replay detected: action card already consumed"},
+                )
+            if record and record.status == "denied":
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Action card was denied"},
+                )
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Approval request not found or expired"},
+            )
+
+        if app_in.resolved_action == "approve":
+            check_args = (
+                app_in.args if app_in.args is not None else pending.get("expected_args")
+            )
+            res = active_approval_provider.consume(
+                approval_id=app_id,
+                nonce=app_in.nonce,
+                actual_args=check_args,
+            )
+            if not res.success:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": res.reason or "Approval failed"},
+                )
+
+            fut = pending.get("future")
+            if fut and not fut.done():
+                fut.set_result(True)
+
+            return JSONResponse(
+                status_code=200,
+                content={"status": "approved", "approvalId": app_id},
+            )
+        else:
+            active_approval_provider.deny(app_id, app_in.nonce)
+            fut = pending.get("future")
+            if fut and not fut.done():
+                fut.set_result(False)
+
+            return JSONResponse(
+                status_code=200,
+                content={"status": "denied", "approvalId": app_id},
+            )
+
+    @app.post("/api/chat/approval")
+    async def chat_approval(request: Request) -> JSONResponse:
+        """Handle human action approval/denial for chat turns."""
+        return await _handle_approval_decision(request)
+
+    @app.post("/api/approval")
+    async def approval(request: Request) -> JSONResponse:
+        """Alias endpoint for human action approval/denial."""
+        return await _handle_approval_decision(request)
+
     @app.post("/api/chat")
     async def chat(
         request: Request, accept: str | None = Header(default=None)
@@ -283,7 +482,13 @@ def create_app(
         # Stream SSE if client requests text/event-stream
         if accept and "text/event-stream" in accept:
             return StreamingResponse(
-                _stream_chat_events(actual_bus, user_id, msg_in),
+                _stream_chat_events(
+                    bus=actual_bus,
+                    user_id=user_id,
+                    msg_in=msg_in,
+                    approval_provider=active_approval_provider,
+                    pending_approvals=pending_approvals,
+                ),
                 media_type="text/event-stream",
             )
 
@@ -322,7 +527,13 @@ def create_app(
             )
 
         return StreamingResponse(
-            _stream_chat_events(actual_bus, user_id, msg_in),
+            _stream_chat_events(
+                bus=actual_bus,
+                user_id=user_id,
+                msg_in=msg_in,
+                approval_provider=active_approval_provider,
+                pending_approvals=pending_approvals,
+            ),
             media_type="text/event-stream",
         )
 
@@ -343,40 +554,299 @@ def create_app(
 
 
 async def _stream_chat_events(
-    bus: MessageBus, user_id: str, msg_in: ChatMessageInput
+    bus: MessageBus,
+    user_id: str,
+    msg_in: ChatMessageInput,
+    approval_provider: ApprovalProvider | None = None,
+    pending_approvals: dict[str, dict[str, Any]] | None = None,
 ) -> AsyncIterator[str]:
-    """Emit AG-UI 1.0 style Server-Sent Events (progress, tool calls, message, done)."""
+    """Emit AG-UI 1.0 style Server-Sent Events (run lifecycle, progress, tools, approvals, text deltas, done)."""
+    run_id = f"run-{uuid.uuid4()}"
+    msg_id = f"msg-{uuid.uuid4()}"
+    event_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    emitted_text_start = False
+    emitted_any_delta = False
+
+    # Emit RunStarted and progress immediately
+    yield format_sse_event(
+        "RunStarted",
+        {
+            "runId": run_id,
+            "requestId": msg_in.request_id,
+            "conversationId": msg_in.conversation_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
     yield format_sse_event(
         "progress",
-        {"status": "thinking", "step": 1, "requestId": msg_in.request_id},
+        {
+            "status": "thinking",
+            "step": 1,
+            "requestId": msg_in.request_id,
+            "conversationId": msg_in.conversation_id,
+        },
     )
 
-    try:
-        reply = await bus.dispatch(
-            IncomingMessage(
-                channel="web",
-                userId=user_id,
-                conversationId=msg_in.conversation_id,
-                requestId=msg_in.request_id,
-                text=msg_in.text,
+    async def turn_hook(event_name: str, payload: dict[str, Any]) -> None:
+        nonlocal emitted_text_start, emitted_any_delta
+        if event_name == "tool_call_start":
+            call_id = payload.get("id") or str(uuid.uuid4())
+            tool_name = payload.get("name", "")
+            clean_args = sanitize_args_summary(payload.get("args", {}))
+            await event_queue.put(
+                format_sse_event(
+                    "ToolCallStart",
+                    {
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
             )
-        )
-        yield format_sse_event(
-            "message",
-            {"role": "assistant", "reply": reply, "requestId": msg_in.request_id},
-        )
-        yield format_sse_event(
-            "done",
-            {"status": "completed", "requestId": msg_in.request_id},
-        )
-    except Exception as exc:
-        yield format_sse_event(
-            "error",
-            {
-                "error": "Request failed. Check provider configuration and connectivity.",
-                "detail": str(exc),
-            },
-        )
+            await event_queue.put(
+                format_sse_event(
+                    "ToolCallArgs",
+                    {
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "args": clean_args,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+        elif event_name == "tool_call_end":
+            call_id = payload.get("id") or ""
+            tool_name = payload.get("name", "")
+            status = payload.get("status", "success")
+            clean_res = sanitize_result_summary(payload.get("result", ""))
+            await event_queue.put(
+                format_sse_event(
+                    "ToolCallEnd",
+                    {
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "status": status,
+                        "result": clean_res,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+        elif event_name == "text_delta":
+            delta = payload.get("delta") or payload.get("text") or ""
+            if delta:
+                if not emitted_text_start:
+                    emitted_text_start = True
+                    await event_queue.put(
+                        format_sse_event(
+                            "TextMessageStart",
+                            {
+                                "messageId": msg_id,
+                                "role": "assistant",
+                                "requestId": msg_in.request_id,
+                                "conversationId": msg_in.conversation_id,
+                            },
+                        )
+                    )
+                emitted_any_delta = True
+                await event_queue.put(
+                    format_sse_event(
+                        "TextMessageContent",
+                        {
+                            "messageId": msg_id,
+                            "delta": delta,
+                            "requestId": msg_in.request_id,
+                            "conversationId": msg_in.conversation_id,
+                        },
+                    )
+                )
+
+    async def web_approve(call: Any, card: Any = None) -> bool:
+        action_card: ActionCard | None = None
+        if isinstance(card, ActionCard):
+            action_card = card
+        elif isinstance(card, dict):
+            action_card = ActionCard.model_validate(card)
+
+        if action_card is None:
+            call_name = getattr(call, "name", "tool")
+            call_args = getattr(call, "input", {})
+            action_card = ActionCard(
+                approvalId=str(uuid.uuid4()),
+                nonce=secrets.token_hex(16),
+                toolId=call_name,
+                rendered=ActionCardRendered(
+                    title=f"Execute {call_name}",
+                    exact=json.dumps(call_args),
+                    effects=["exec"],
+                    taint="clean",
+                    reversible=False,
+                ),
+            )
+
+        call_input = getattr(call, "input", {})
+        if approval_provider is not None:
+            approval_provider.register(action_card, input_args=call_input)
+
+        card_dict = action_card.model_dump(by_alias=True)
+        card_dict["requestId"] = msg_in.request_id
+        card_dict["conversationId"] = msg_in.conversation_id
+
+        await event_queue.put(format_sse_event("ActionCard", card_dict))
+        await event_queue.put(format_sse_event("approval", card_dict))
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[bool] = loop.create_future()
+        app_id = action_card.approval_id
+
+        if pending_approvals is not None:
+            pending_approvals[app_id] = {
+                "future": fut,
+                "card": action_card,
+                "expected_args": call_input,
+            }
+
+        try:
+            return await asyncio.wait_for(fut, timeout=300.0)
+        except (TimeoutError, asyncio.CancelledError):
+            return False
+        finally:
+            if pending_approvals is not None:
+                pending_approvals.pop(app_id, None)
+
+    async def dispatch_worker() -> None:
+        try:
+            token = set_turn_event_hook(turn_hook)
+            try:
+                reply = await bus.dispatch(
+                    IncomingMessage(
+                        channel="web",
+                        userId=user_id,
+                        conversationId=msg_in.conversation_id,
+                        requestId=msg_in.request_id,
+                        text=msg_in.text,
+                    ),
+                    approve=web_approve,
+                )
+            finally:
+                reset_turn_event_hook(token)
+
+            # Fallback if agent did not emit incremental deltas
+            if not emitted_text_start:
+                await event_queue.put(
+                    format_sse_event(
+                        "TextMessageStart",
+                        {
+                            "messageId": msg_id,
+                            "role": "assistant",
+                            "requestId": msg_in.request_id,
+                            "conversationId": msg_in.conversation_id,
+                        },
+                    )
+                )
+            if not emitted_any_delta:
+                await event_queue.put(
+                    format_sse_event(
+                        "TextMessageContent",
+                        {
+                            "messageId": msg_id,
+                            "delta": reply,
+                            "requestId": msg_in.request_id,
+                            "conversationId": msg_in.conversation_id,
+                        },
+                    )
+                )
+
+            await event_queue.put(
+                format_sse_event(
+                    "TextMessageEnd",
+                    {
+                        "messageId": msg_id,
+                        "text": reply,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+            # Legacy message event for backward compatibility
+            await event_queue.put(
+                format_sse_event(
+                    "message",
+                    {
+                        "role": "assistant",
+                        "reply": reply,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+            # Legacy done event for backward compatibility
+            await event_queue.put(
+                format_sse_event(
+                    "done",
+                    {
+                        "status": "completed",
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+            # AG-UI RunFinished event
+            await event_queue.put(
+                format_sse_event(
+                    "RunFinished",
+                    {
+                        "runId": run_id,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                        "status": "completed",
+                    },
+                )
+            )
+        except Exception as exc:
+            err_msg = "Request failed. Check provider configuration and connectivity."
+            await event_queue.put(
+                format_sse_event(
+                    "error",
+                    {
+                        "error": err_msg,
+                        "detail": str(exc),
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                    },
+                )
+            )
+            await event_queue.put(
+                format_sse_event(
+                    "RunFinished",
+                    {
+                        "runId": run_id,
+                        "requestId": msg_in.request_id,
+                        "conversationId": msg_in.conversation_id,
+                        "status": "error",
+                        "error": err_msg,
+                    },
+                )
+            )
+        finally:
+            await event_queue.put(None)
+
+    task = asyncio.create_task(dispatch_worker())
+    try:
+        while True:
+            item = await event_queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 class ServerAddress:
@@ -407,6 +877,7 @@ class WebAdapter:
         bus: MessageBus,
         memory: Any,
         options: dict[str, Any] | WebAdapterOptions,
+        approval_provider: ApprovalProvider | None = None,
     ) -> None:
         if isinstance(options, dict):
             opts = WebAdapterOptions.model_validate(options)
@@ -419,11 +890,13 @@ class WebAdapter:
         self.bus = bus
         self.memory = memory
         self.options = opts
+        self.approval_provider = approval_provider
         self.app = create_app(
             bus=bus,
             memory=memory,
             token=opts.token,
             user_id=opts.user_id,
+            approval_provider=approval_provider,
         )
 
         self._host = opts.host
@@ -543,6 +1016,7 @@ class WebAdapter:
 app = create_app()
 
 __all__ = [
+    "ApprovalInput",
     "ChatMessageInput",
     "HealthResponse",
     "InboxItem",
@@ -554,4 +1028,7 @@ __all__ = [
     "app",
     "create_app",
     "format_sse_event",
+    "sanitize_args_summary",
+    "sanitize_result_summary",
+    "sanitize_secret_patterns",
 ]
