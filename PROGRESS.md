@@ -189,3 +189,12 @@ credentials, or pushes were performed.
   plus 6 Jest tests in 1 suite (74 total)** passed. CDK emitted a Lambda Node 20
   runtime deprecation warning; review the runtime before deployment.
 - A credential-pattern scan found no matches in tracked/imported files.
+
+# Research — 2026-10-16
+
+Deep paper/project research completed in `~/projects/yusufclaw-research` and copied into `docs/`:
+
+- `docs/RESEARCH.md` — architectures, memory, tools, interfaces, security, evaluation (Turkish summary at top)
+- `docs/DESIGN-RECOMMENDATIONS.md` — ADRs, package contracts, P0/P1/P2 ticket roadmap
+
+Codex research unit exited with ChatGPT usage limit after writing both files; deliverables are complete and self-contained. No AWS deploy. Next implementation priority from the design roadmap: durable structured memory (P0-07 / P1-02–03) on top of the merged Phase 2 main.
