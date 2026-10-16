@@ -41,13 +41,6 @@ from yusufclaw.gateway.telegram import (
     TelegramVoice,
     split_telegram_text,
 )
-from yusufclaw.gateway.whatsapp import (
-    WhatsAppAdapter,
-    WhatsAppApi,
-    create_whatsapp_router,
-    normalize_phone_number,
-    split_whatsapp_text,
-)
 from yusufclaw.gateway.web import (
     ChatMessageInput,
     HealthResponse,
@@ -68,6 +61,13 @@ from yusufclaw.gateway.web_page import (
     chatPage,
     chatScript,
     chatStyle,
+)
+from yusufclaw.gateway.whatsapp import (
+    WhatsAppAdapter,
+    WhatsAppApi,
+    create_whatsapp_router,
+    normalize_phone_number,
+    split_whatsapp_text,
 )
 
 __all__ = [

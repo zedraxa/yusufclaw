@@ -149,13 +149,14 @@ async def async_main(args: list[str] | None = None) -> None:
                 access_token=config.WHATSAPP_ACCESS_TOKEN,
                 phone_number_id=config.WHATSAPP_PHONE_NUMBER_ID,
             )
-            wa_adapter = WhatsAppAdapter(
+            _wa_adapter = WhatsAppAdapter(
                 bus=bus,
                 api=wa_api,
                 allowed_numbers=set(config.allowed_whatsapp_numbers),
                 verify_token=config.WHATSAPP_VERIFY_TOKEN or "",
                 app_secret=config.WHATSAPP_APP_SECRET or "",
             )
+            _ = _wa_adapter
             sys.stdout.write("WhatsApp adapter initialized and waiting for webhook events.\n")
             sys.stdout.flush()
             await shutdown_event.wait()
