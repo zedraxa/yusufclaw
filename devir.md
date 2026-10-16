@@ -598,3 +598,72 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
   - `uv run mypy src`: 60 kaynak dosyasında tam strict modda 0 hata.
 - **Kılavuz Belgesi**: `PY-MCP.md`.
+
+---
+
+## 14. Python AG-UI 1.0 SSE Olay Akışı, YC-05 Web Onay Entegrasyonu ve Web UI — `py-agui` Dalı
+
+### 14.1 Genel Mimari ve Kararlar
+- `docs/ARCHITECTURE-v2.md` Interfaces katmanı (Web AG-UI 1.0) ve `PY-GATEWAY.md` hedefleri doğrultusunda, Web Gateway (`src/yusufclaw/gateway/web.py`) üzerindeki taslak SSE akışı (`progress -> message -> done`) tam teşekküllü, gerçek zamanlı ve gözlemlenebilir bir AG-UI 1.0 olay akışına dönüştürülmüştür.
+- **Kapsam ve İzolasyon Güvencesi**:
+  - Kesinlikle dokunulmayan modüller: `security/`, `memory/`, `orchestration/`, `mcp/`, `sandbox/`, `skills/`, `routines/`, `infra_py/` ve TypeScript `packages/`.
+  - Değiştirilen dosyalar yalnızca: `src/yusufclaw/gateway/web.py`, `src/yusufclaw/gateway/web_page.py`, `src/yusufclaw/gateway/approval.py`, `src/yusufclaw/agent.py` (yalnızca opsiyonel turn hook) ve `tests/python/test_web_gateway.py`.
+- **Güvenlik ve İstemci Bütünlüğü Standartları**:
+  - **Sıkı CSP**: `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'`.
+  - **XSS ve DOM Güvenliği**: Dinamik veriler asla `innerHTML` veya `eval` ile işlenmez; tüm çıktılar `textContent` ve `document.createElement` üzerinden güvenle basılır.
+  - **Depolama İzolasyonu**: Tarayıcı tarafında hiçbir hassas veri `localStorage` veya `sessionStorage` içinde saklanmaz.
+  - **Yetkilendirme ve Köken Denetimi**: `Authorization: Bearer <token>` ve `Origin` / `Sec-Fetch-Site` doğrulaması korunur; istek gövdesi 100KB ile sınırlandırılır.
+  - **Veri Maskeleme Motoru**: `sanitize_secret_patterns` ve `sanitize_args_summary` ile Bearer token'ları, AWS erişim anahtarları (`AKIA...`), genel API anahtarları (`ghp_...`, `sk-...`, `glpat-...`), URL temel kimlik bilgileri ve gizli anahtar/parola alanları (`[REDACTED]`) SSE akışına çıkmadan önce temizlenir; argümanlar 300 karakter ile sınırlandırılır.
+
+### 14.2 Gerçekleştirilen Bileşenler
+1. **YC-05 İçi Bellek Onay Sağlayıcısı (`src/yusufclaw/gateway/approval.py`)**:
+   - `InMemoryApprovalProvider`: `@runtime_checkable class ApprovalProvider(Protocol)` arayüzünü uygular.
+   - Her `ActionCard` için kriptografik rastgele tek kullanımlık nonce (`secrets.token_hex(16)`) ve kanonik SHA-256 argüman özeti üretir.
+   - **Tek Kullanımlık Replay Koruması**: Onaylanmış veya reddedilmiş kartların yeniden kullanılması engellenir (HTTP 400 `Replay detected`).
+   - **Tahrifat Tespiti**: Girdi parametreleri imzalanan özetten farklıysa işlem derhal reddedilir (HTTP 400 `Action arguments have been tampered with`).
+   - **Red Kaydı ve Süre Aşımı**: Reddedilen eylemler kalıcı olarak kaydedilir; süresi dolan kartlar geçersiz kılınır.
+2. **Asenkron Geri Bildirim ve Turn Olay Kancası (`src/yusufclaw/agent.py`)**:
+   - `TurnEventHook` (`ContextVar` tabanlı `set_turn_event_hook`, `get_turn_event_hook`): Eşzamanlı isteklerde global durum kirlenmesi olmadan istek başına olay dinleyicisi sağlar.
+   - `Agent.handle(..., on_event=...)` ve `Agent.run(..., on_event=...)` kancaları.
+   - `model_node`: Model sağlayıcısı akışı (`stream`) desteklediğinde `text_delta` olayları yayar; desteklemediğinde tam yanıtı tek seferde üretir.
+   - `tool_node`: Araç çalıştırma başlangıcında `tool_call_start`, onay gerektiğinde `approval_requested` ve tamamlanmada `tool_call_end` olayları yayar.
+   - Kanca tanımlanmadığında mevcut çekirdek agent davranışı %100 farksız ve ek yük getirmeden çalışır.
+3. **Web Gateway AG-UI 1.0 SSE Akışı ve Uç Noktaları (`src/yusufclaw/gateway/web.py`)**:
+   - `POST /api/chat/stream`: Eşzamanlı `asyncio.Queue` ile agent dönüşünü ve iç kanca olaylarını birleştirir.
+   - **Olay Akış Hiyerarşisi**:
+     * `RunStarted`: `requestId`, `conversationId`, `timestamp`.
+     * `progress`: Geriye dönük uyumluluk durum bildirimleri.
+     * `ToolCallStart`, `ToolCallArgs` (maskeli özet), `ToolCallEnd` (durum ve süre).
+     * `ActionCard` / `approval`: YC-05 onay kartı verisi.
+     * `TextMessageStart`, `TextMessageContent` (artımlı belirteçler), `TextMessageEnd`.
+     * `message` & `done`: Eski istemcilerle tam geriye dönük uyumluluk.
+     * `RunFinished`: İşlem tamamlama yaşam döngüsü.
+     * `error`: Hata kodu ve temizlenmiş hata mesajı.
+   - `POST /api/chat/approval` ve `POST /api/approval`: Web onay uç noktaları (`ApprovalInput` modeliyle `approvalId`, `nonce`, `action`/`decision` kabul eder; `extra="forbid"` ile yabancı alanları reddeder).
+4. **Web Arayüzü İstemcisi (`src/yusufclaw/gateway/web_page.py`)**:
+   - `CHAT_PAGE`: `#approvals` ve `#tools` kapsayıcıları eklendi.
+   - `CHAT_STYLE`: Kart stilleri, yeşil onay butonu, kırmızı red butonu, araç çalıştırma etiketleri.
+   - `CHAT_SCRIPT`: `ReadableStream` SSE ayrıştırıcısı ile `RunStarted`, `TextMessageContent` (harf harf ekleme), `ToolCallStart/Args/End` ve `ActionCard` kartlarının canlı çizimi; Onayla / Reddet butonları tıklandığında `/api/chat/approval` uç noktasına güvenli POST gönderimi.
+
+### 14.3 Test ve Doğrulama
+- **Genişletilen Test Dosyası**: `tests/python/test_web_gateway.py` (13 kapsamlı test senaryosu):
+  1. `test_web_auth_cross_origin_validation_and_token_free_page`: Token doğrulaması, köken kontrolü ve tokensiz HTML sunumu.
+  2. `test_web_chat_success_and_error_sanitization`: Standart sohbet ve hata temizleme.
+  3. `test_web_scheduled_replies_delivery_and_inbox`: Zamanlanmış rutin gelen kutusu teslimatı.
+  4. `test_web_adapter_requires_token_and_socket_lifecycle`: WebAdapter soket yaşam döngüsü.
+  5. `test_web_ag_ui_sse_streaming`: Eski SSE akış formatı uyumluluğu.
+  6. `test_web_ag_ui_1_0_run_lifecycle_and_fallback`: `RunStarted` -> `TextMessageStart/Content/End` -> `RunFinished` döngüsü ve fallback akışı.
+  7. `test_web_ag_ui_1_0_mid_turn_incremental_streaming`: Gerçek zamanlı artımlı belirteç akışı.
+  8. `test_web_ag_ui_1_0_tool_calls_and_secret_masking`: Araç çağrı yaşam döngüsü ve Bearer/AWS/Github anahtar maskeleme doğrulaması.
+  9. `test_web_ag_ui_1_0_interactive_approval_lifecycle_and_yc05_checks`: `ActionCard` akışı, web onay uç noktası, tek kullanımlık nonce, replay engelleme ve tahrifat reddi.
+  10. `test_web_ag_ui_1_0_denial_lifecycle`: `deny` aksiyonunun işlenmesi, red kaydı ve sonradan onayın engellenmesi.
+  11. `test_web_ui_rendered_elements_and_approval_controls`: HTML ve JS içerik denetimi; CSP uyumluluğu, `innerHTML`, `localStorage` ve `sessionStorage` bulunmadığının kanıtı.
+  12. `test_sanitize_secret_patterns_and_args_summary`: Regex maskeleme ve sözlük/liste argüman temizleme testi.
+  13. `test_approval_input_validation`: Pydantic girdi doğrulaması, alias desteği ve yabancı alan reddi.
+- **Doğrulama Sonuçları**:
+  - `uv run pytest`: **147 passed, 1 skipped** (25.41s, 0 hata, %100 offline).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 68 kaynak dosyasında tam strict tip denetimi (`Success: no issues found in 68 source files`).
+  - `MYPYPATH=src uv run mypy tests/python/test_web_gateway.py`: 0 hata.
+- **Kılavuz Belgesi**: `PY-AGUI.md`.
+
