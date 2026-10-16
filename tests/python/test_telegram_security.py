@@ -3,12 +3,6 @@
 import pytest
 
 from yusufclaw.agent import Agent
-from yusufclaw.gateway.telegram import (
-    TelegramAdapter,
-    build_telegram_card_keyboard,
-    format_telegram_card_message,
-    handle_telegram_callback_data,
-)
 from yusufclaw.models import FakeProvider, ModelResponse, ToolCall
 from yusufclaw.security import (
     ActionCard,
@@ -17,6 +11,9 @@ from yusufclaw.security import (
     SessionTaint,
     ToolManifest,
     Value,
+    build_telegram_card_keyboard,
+    format_telegram_card_message,
+    handle_telegram_callback_data,
 )
 from yusufclaw.tools import create_file_write_tool, create_web_fetch_tool
 
@@ -152,22 +149,9 @@ def test_handle_telegram_callback_data_replay_and_tamper_protection() -> None:
     assert "Argument tampering detected" in res_tamper["message"]
 
 
-def test_telegram_adapter_handle_callback_query() -> None:
-    """Verify TelegramAdapter.handle_callback_query interface."""
-    adapter = TelegramAdapter(allowed_users=["12345"])
-    manifest = ToolManifest(id="shell", version="1.0.0", effects=["exec"])
-    card = adapter.card_store.create(
-        manifest,
-        Value(v={"command": "pwd"}, labels=[]),
-        SessionTaint(contaminated=False),
-    )
-
-    res = adapter.handle_callback_query(
-        data=f"deny:{card.approval_id}:{card.nonce}",
-        user_id="12345",
-    )
-    assert res["status"] == "denied"
-
+# test_telegram_adapter_handle_callback_query removed: the security-era
+# TelegramAdapter.card_store API was replaced by gateway ApprovalProvider;
+# callback deny/approve coverage lives in tests/python/test_telegram_gateway.py.
 
 @pytest.mark.asyncio
 async def test_agent_loop_taint_and_approval_enforcement() -> None:
