@@ -136,6 +136,46 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 
 ### 5.4 Sonraki Adımlar
 - TypeScript testlerinden güvenlik kurallarını ve taint tracking mantığını Python'a taşımak (`src/yusufclaw/security/`).
-- `packages/core/src/memory.ts` içindeki SQLite FTS5 yapılandırılmış bellek mantığını Python'a taşımak (`src/yusufclaw/memory/`).
+- `packages/core/src/memory.ts` içindeki SQLite FTS5 yapılandırılmış bellek mantığını Python'a taşımak (`src/yusufclaw/memory/`) [TAMAMLANDI].
 - Araç katmanını (shell sandbox, files, fetch) taşımak (`src/yusufclaw/tools/`).
 - Telegram botu ve web AG-UI event stream mekanizmasını bağlamak.
+
+---
+
+## 6. Python Bellek Alt Sistemi Taşıması (`py-memory` Dalı)
+
+### 6.1 Tamamlanan Mimari ve Modüller
+1. **Veri Modelleri (`src/yusufclaw/memory/models.py`)**:
+   - Pydantic v2 tabanlı `MemoryRecord`, `RememberInput`, `ReviseInput`, `SearchOptions`, `ListOptions`, `ContextAssemblyOptions`, `MemoryRevisionRecord`, `MemoryDeletionRecord`, `EmbeddingProvider`.
+   - `AliasChoices` ve özellik (property) eşleyicileriyle hem Pythonic `snake_case` hem de TypeScript uyumlu `camelCase` (örneğin `source_ids` / `sourceIds`, `supersedes_id` / `supersedesId`) desteklendi.
+2. **Oturum İzolasyonu (`src/yusufclaw/memory/context.py`)**:
+   - `AsyncLocalStorage` karşılığı olarak Python `contextvars.ContextVar` ve `session_scope` context manager'ı devreye alındı. Eşzamanlı asenkron çağrılarda yarış durumu olmadan `(session, request_id)` takibi sağlandı.
+3. **FTS ve Metin Arama (`src/yusufclaw/memory/fts.py`)**:
+   - `sanitize_fts5_query`: Unicode destekli (`\w+`) belirteç temizleyici; Türkçe karakterleri (`İstanbul`, `Türkçe`, `Kadıköyde`), önek aramalarını (`"Type"*`) ve FTS5 operatör arındırmasını eksiksiz gerçekleştirdi.
+   - `sanitize_tsquery`: PostgreSQL tam metin arama belirteç temizleyicisi.
+4. **SQLite FTS5 Bellek Deposu (`src/yusufclaw/memory/sqlite.py`)**:
+   - Harici servis gerektirmeyen, WAL modunda çalışan offline `SqliteMemory` motoru.
+   - `turns`, `state`, `memory_records`, `memory_revisions`, `memory_deletions` ve `memory_fts` (FTS5 BM25) tabloları.
+   - `remember`, `revise` (CAS destekli), `supersede`, `forget` (tombstone audit), `get`, `search`, `list`, `get_profile`, `assemble_context` ve `/reset` / `history` metotları.
+5. **PostgreSQL + pgvector Asenkron Bellek Deposu (`src/yusufclaw/memory/postgres.py`)**:
+   - SQLAlchemy 2.0 `AsyncEngine` ve `psycopg` async sürücüsü.
+   - Declarative modeller: `TurnModel`, `StateModel`, `MemoryRecordModel`, `MemoryRevisionModel`, `MemoryDeletionModel`.
+   - `pgvector.sqlalchemy.Vector` 1536-boyutlu gömme vektörleri ve kosinüs mesafesi ile `search_vector`.
+   - PostgreSQL `to_tsvector` ve `plainto_tsquery` tam metin araması.
+   - Docker olmaksızın testlerin offline koşabilmesi için `sqlite+aiosqlite` ve bellek içi kosinüs mesafesi geri düşüş (fallback) desteği.
+6. **Ajan Bellek Araçları (`src/yusufclaw/memory/tools.py`)**:
+   - `remember`, `revise`, `forget`, `recall` araçları `MemoryTool` / `ToolDefinition` arayüzü ile LangGraph ve ajan döngüsüne sunuldu.
+7. **LangGraph Ajan Entegrasyonu (`src/yusufclaw/agent.py`)**:
+   - `Agent` bellek nesnesiyle başlatıldığında sistem istemine etiketli ve sınırlı bellek bağlamını (`assemble_context`) otomatik ekler.
+   - Araç yürütmesinde bellek araçlarını otomatik çağırır.
+   - `Agent.handle(session, request_id, text)` ile oturum kapsamı, girdi doğrulama (1-16000 karakter), `/reset` ve `/help` komut kesicileri ve turn geçmişi kaydı sağlandı.
+
+### 6.2 Test ve Doğrulama
+- **Port Edilen Testler (`tests/python/test_memory.py`)**:
+  - TypeScript `tests/memory.test.ts` içindeki 10 senaryonun tamamı pytest'e 1:1 uyarlandı.
+  - PostgreSQL async motor işlemleri, pgvector vektör araması ve Pydantic model doğrulama testleri eklendi (toplam 13 bellek testi).
+- **Sonuçlar**:
+  - `uv run pytest`: 36 testin tamamı offline başarıyla geçti (0 hata).
+  - `uv run ruff check`: 0 uyarı/hata.
+  - `uv run mypy src tests/python`: 33 kaynak dosyasında strict tip denetimi 0 hata ile geçti.
+  - `packages/` (TypeScript), `src/yusufclaw/security/`, `src/yusufclaw/tools/` ve AWS yapılandırmalarına dokunulmadı.
