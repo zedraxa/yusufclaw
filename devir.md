@@ -859,3 +859,14 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
   - `uv run mypy src`: 74 kaynak dosyasında tam strict modda 0 hata (`Success: no issues found in 74 source files`).
 - **Kılavuz Belgesi**: `docs/CAPABILITY-MATRIX.md`.
+
+---
+
+## 19. Python Shared Coordination Substrate — `py-coord` Dalı
+
+- Yeni `src/yusufclaw/coordination/` paketi: Pydantic modelleri ve async `publish`, `search`, `visit`, `list_events` API; Postgres adaptörü için `CoordinationStore` protokolü.
+- SQLite WAL üzerinde append-only `publish/claim/result/artifact_ref` olayları, UUID blob deposu, SHA-256 bütünlük kontrolü ve atomik FTS5/BM25 indeksleme. UPDATE/DELETE trigger koruması, kapsam izolasyonu ve sıralı cursor pagination eklendi.
+- Sıralama, atıf sayısı ve ziyaret sıklığı doğruluk sayılmaz. Arama sonuçları daima doğrulanmamıştır; opsiyonel async `Verifier` gerçek kanıtı kontrol eder. Başarısız doğrulama hata verir; karar yalnızca ilgili ziyaret için geçerlidir.
+- 8 yeni test: publish/search/visit, yeniden açılışta kalıcılık, append-only koruması, kapsam ve rollback, eşzamanlı bağlantılar, metadata araması ve doğrulama sınırları.
+- Doğrulama: `uv run pytest -q` → **201 passed, 1 skipped**; `uv run ruff check .` → temiz; `uv run mypy src` → **79 dosyada hata yok**.
+- Kullanım, güven sınırları ve backend sözleşmesi: `docs/PY-COORD.md`. Agent, models, gateway/web.py, roles, queue ve infra_py değiştirilmedi; AWS dağıtımı yapılmadı. §17–18 korunmuştur.
