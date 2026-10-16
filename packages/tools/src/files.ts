@@ -110,6 +110,13 @@ export function createFileReadTool(options: FileToolsOptions = {}): AgentTool {
   return {
     name: 'file_read',
     description: 'Read the contents of a file within the workspace root.',
+    manifest: {
+      id: 'file_read',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['read_private'],
+      resources: { paths: [root] }
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -164,6 +171,13 @@ export function createFileWriteTool(options: FileToolsOptions = {}): AgentTool {
   return {
     name: 'file_write',
     description: 'Write or overwrite a file within the workspace root. Requires explicit user approval.',
+    manifest: {
+      id: 'file_write',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['write_local'],
+      resources: { paths: [root] }
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -209,6 +223,13 @@ export function createFileListTool(options: FileToolsOptions = {}): AgentTool {
   return {
     name: 'file_list',
     description: 'List files and directories within a directory inside the workspace root.',
+    manifest: {
+      id: 'file_list',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['read_private'],
+      resources: { paths: [root] }
+    },
     inputSchema: {
       type: 'object',
       properties: {

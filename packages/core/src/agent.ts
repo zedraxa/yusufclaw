@@ -2,17 +2,27 @@ import { Ajv, type ValidateFunction } from 'ajv';
 import type { Message, ModelProvider } from '@yusufclaw/models';
 import type { AgentTool, ApproveTool } from '@yusufclaw/tools';
 import { SqliteMemory } from './memory.js';
+import { decide, Grants, type ActionCard, type SessionTaint, type Value } from './policy/index.js';
 
 export class Agent {
   private readonly tools = new Map<string, { tool: AgentTool; validate: ValidateFunction }>();
   private readonly queues = new Map<string, Promise<unknown>>();
-  constructor(private readonly provider: ModelProvider, readonly memory: SqliteMemory, tools: AgentTool[] = [], private readonly options: { system?: string; skills?: string; maxSteps?: number; historyTurns?: number } = {}) {
+  private readonly taints = new Map<string, SessionTaint>();
+  constructor(private readonly provider: ModelProvider, readonly memory: SqliteMemory, tools: AgentTool[] = [], private readonly options: { system?: string; skills?: string; maxSteps?: number; historyTurns?: number; grants?: Grants } = {}) {
     if (!Number.isInteger(options.maxSteps ?? 8) || (options.maxSteps ?? 8) < 1) throw new Error('maxSteps must be a positive integer');
     const ajv = new Ajv({ allErrors: true });
     for (const tool of tools) {
       if (this.tools.has(tool.name)) throw new Error(`Duplicate tool: ${tool.name}`);
       this.tools.set(tool.name, { tool, validate: ajv.compile(tool.inputSchema) });
     }
+  }
+
+  getTaint(session: string): SessionTaint {
+    return this.taints.get(session) ?? { contaminated: false, sources: [] };
+  }
+
+  setTaint(session: string, taint: SessionTaint): void {
+    this.taints.set(session, { ...taint });
   }
   // Serializes complete turns and reset commands within a session; other sessions remain independent.
   handle(session: string, requestId: string, text: string, approve?: ApproveTool, signal?: AbortSignal): Promise<string> {
@@ -25,13 +35,24 @@ export class Agent {
   private async run(session: string, requestId: string, text: string, approve?: ApproveTool, signal?: AbortSignal): Promise<string> {
     signal?.throwIfAborted();
     if (!text.trim() || text.length > 16_000) throw new Error('Message must contain 1–16000 characters');
-    if (text.trim() === '/reset') { this.memory.clear(session); return 'Conversation cleared.'; }
+    if (text.trim() === '/reset') {
+      this.memory.clear(session);
+      this.taints.delete(session);
+      return 'Conversation cleared.';
+    }
     if (text.trim() === '/help' || text.trim() === '/start') return 'Send a message to chat. /reset clears this conversation; /help shows this message.';
     const existing = this.memory.reply(session, requestId);
     if (existing !== undefined) return existing;
     const history = this.memory.history(session, this.options.historyTurns ?? 20);
     const turn: Message[] = [{ role: 'user', text }];
     const seenCalls = new Set<string>();
+
+    let taint = this.taints.get(session);
+    if (!taint) {
+      taint = { contaminated: false, sources: [] };
+      this.taints.set(session, taint);
+    }
+
     for (let step = 0; step < (this.options.maxSteps ?? 8); step++) {
       signal?.throwIfAborted();
       const response = await this.provider.complete({
@@ -60,14 +81,58 @@ export class Agent {
           signal?.throwIfAborted();
           if (!entry) throw new Error('Unknown tool');
           if (!entry.validate(call.input)) throw new Error('Invalid tool arguments');
-          const needsApproval = typeof entry.tool.requiresApproval === 'function' ? entry.tool.requiresApproval(call.input) : Boolean(entry.tool.requiresApproval);
-          if (needsApproval && !(await approve?.(call))) throw new Error('Tool approval denied');
+
+          const manifest = entry.tool.manifest ?? {
+            id: call.name,
+            version: '1.0.0',
+            source: 'builtin' as const,
+            effects: []
+          };
+
+          const argsValue: Value<Record<string, unknown>> = {
+            v: call.input,
+            labels: [{
+              origin: 'agent',
+              integrity: taint.contaminated ? 'untrusted' : 'trusted',
+              secrecy: 'public'
+            }]
+          };
+
+          const decision = decide(manifest, argsValue, taint, this.options.grants);
+          if (decision.kind === 'deny') {
+            throw new Error(`Tool policy denied: ${decision.reason}`);
+          }
+
+          let actionCard: ActionCard | undefined;
+          let needsApproval = typeof entry.tool.requiresApproval === 'function'
+            ? entry.tool.requiresApproval(call.input)
+            : Boolean(entry.tool.requiresApproval);
+
+          if (decision.kind === 'card') {
+            needsApproval = true;
+            actionCard = decision.card;
+          }
+
+          if (needsApproval && !(await approve?.(call, actionCard))) {
+            throw new Error('Tool approval denied');
+          }
+
           signal?.throwIfAborted();
           result = await entry.tool.execute(call.input, signal);
+
+          if (manifest.effects.includes('read_untrusted')) {
+            taint.contaminated = true;
+            if (!taint.sources.includes(call.name)) {
+              taint.sources.push(call.name);
+            }
+          }
         } catch (cause) {
           signal?.throwIfAborted();
           error = true;
-          result = cause instanceof Error && ['Unknown tool', 'Invalid tool arguments', 'Tool approval denied'].includes(cause.message) ? cause.message : 'Tool execution failed';
+          result = cause instanceof Error && (
+            ['Unknown tool', 'Invalid tool arguments', 'Tool approval denied'].includes(cause.message) ||
+            cause.message.startsWith('Tool policy denied')
+          ) ? cause.message : 'Tool execution failed';
         }
         turn.push({ role: 'tool', callId: call.id, name: call.name, text: result.slice(0, 32_000), error });
       }

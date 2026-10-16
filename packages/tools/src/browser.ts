@@ -36,6 +36,13 @@ export function createBrowserTool(options: BrowserToolOptions = {}): AgentTool {
   return {
     name: 'browser',
     description: 'Browse web pages using Playwright headless browser. Returns page title and text content.',
+    manifest: {
+      id: 'browser',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['read_untrusted', 'egress'],
+      resources: {}
+    },
     inputSchema: {
       type: 'object',
       properties: {

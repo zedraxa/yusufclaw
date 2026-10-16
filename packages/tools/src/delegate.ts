@@ -46,6 +46,13 @@ export function createDelegateAgentTool(options: DelegateAgentToolOptions = {}):
   return {
     name: 'delegate_agent',
     description: 'Delegate a task to a local CLI agent (agy or codex). Requires approval and must be enabled via ENABLE_AGENT_DELEGATION=true.',
+    manifest: {
+      id: 'delegate_agent',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['exec', 'write_local'],
+      resources: { paths: [workspaceDir] }
+    },
     inputSchema: {
       type: 'object',
       properties: {

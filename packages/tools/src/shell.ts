@@ -157,6 +157,13 @@ export function createShellTool(options: ShellToolOptions = {}): AgentTool {
   return {
     name: 'shell',
     description: 'Execute a shell command within the workspace directory. Dangerous or destructive commands require explicit user approval.',
+    manifest: {
+      id: 'shell',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['exec', 'read_private', 'write_local'],
+      resources: { paths: [workspaceDir] }
+    },
     inputSchema: {
       type: 'object',
       properties: {
