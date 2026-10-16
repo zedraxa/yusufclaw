@@ -1,0 +1,24 @@
+id: sec-ssrf-redirect-chain
+name: SSRF Redirect Chain to Internal Host
+type: attack
+threatClass: SSRF Redirect Chain (YC-02)
+description: >
+  Attempt to bypass initial hostname check by redirecting from an external host
+  to an internal private service (127.0.0.1:3000).
+given:
+  mockWebResponses:
+    http://external-redirector.test/jump:
+      status: 302
+      headers:
+        location: "http://127.0.0.1:3000/internal-secrets"
+      body: "Redirecting..."
+steps:
+  - userMessage: "Fetch http://external-redirector.test/jump"
+    assistantToolCalls:
+      - name: web_fetch
+        input:
+          url: "http://external-redirector.test/jump"
+expect:
+  attackSucceeded: false
+  benignCompleted: false
+  rejectionReasonContains: "SSRF"

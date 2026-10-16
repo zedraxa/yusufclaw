@@ -1,20 +1,30 @@
 import type { ToolCall, ToolDefinition } from '@yusufclaw/models';
+import type { ToolManifest } from './manifest.js';
 import { createShellTool, shellTool, type ShellToolOptions } from './shell.js';
-import { createFileTools, fileReadTool, fileWriteTool, fileListTool, type FileToolsOptions } from './files.js';
+import { createFileTools, fileReadTool, fileWriteTool, fileListTool, DEFAULT_WORKSPACE_DIR, type FileToolsOptions } from './files.js';
 import { createWebFetchTool, webFetchTool, type WebFetchToolOptions } from './fetch.js';
 import { createBrowserTool, browserTool, type BrowserToolOptions } from './browser.js';
 import { createDelegateAgentTool, delegateAgentTool, type DelegateAgentToolOptions } from './delegate.js';
 
+export * from './manifest.js';
+
 export interface AgentTool extends ToolDefinition {
+  manifest?: ToolManifest;
   requiresApproval?: boolean | ((input: Record<string, unknown>) => boolean);
   execute(input: Record<string, unknown>, signal?: AbortSignal): Promise<string>;
 }
 
-export type ApproveTool = (call: ToolCall) => Promise<boolean>;
+export type ApproveTool = (call: ToolCall, card?: unknown) => Promise<boolean>;
 
 export const currentTime: AgentTool = {
   name: 'current_time',
   description: 'Return the current date and time in UTC.',
+  manifest: {
+    id: 'current_time',
+    version: '1.0.0',
+    source: 'builtin',
+    effects: []
+  },
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   async execute() { return new Date().toISOString(); },
 };
@@ -47,7 +57,7 @@ export interface DefaultToolsOptions {
  * - delegate_agent (runs agy or codex CLI as subprocess, disabled unless enabled)
  */
 export function createDefaultTools(options: DefaultToolsOptions = {}): AgentTool[] {
-  const ws = options.workspaceDir;
+  const ws = options.workspaceDir || process.env.WORKSPACE_DIR || DEFAULT_WORKSPACE_DIR;
   return [
     currentTime,
     createShellTool({ workspaceDir: ws, ...options.shell }),

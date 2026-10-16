@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, SqliteMemory } from '../packages/core/dist/index.js';
-import { MessageBus, loadConfig, TelegramAdapter, TelegramApi, TelegramApiError, splitTelegramText, type TelegramTransport, type TelegramUpdate } from '../packages/gateway/dist/index.js';
+import { Agent, SqliteMemory, ActionCardStore } from '../packages/core/dist/index.js';
+import { MessageBus, loadConfig, TelegramAdapter, TelegramApi, TelegramApiError, splitTelegramText, formatTelegramCardMessage, buildTelegramCardKeyboard, type TelegramTransport, type TelegramUpdate } from '../packages/gateway/dist/index.js';
 import type { ModelProvider } from '../packages/models/dist/index.js';
 const databases: SqliteMemory[] = [];
 afterEach(() => { databases.forEach(db => db.close()); databases.length = 0; });
@@ -99,3 +99,126 @@ describe('Telegram', () => {
     await expect(api.call('getUpdates', {})).rejects.toMatchObject({ code: 429, retryAfter: 7 });
   });
 });
+
+describe('YC-05: ActionCard + Telegram inline approvals with replay and tampering protection', () => {
+  it('protects against replay and argument tampering', () => {
+    const store = new ActionCardStore();
+    const manifest = {
+      id: 'shell',
+      version: '1.0.0',
+      source: 'builtin' as const,
+      effects: ['exec' as const]
+    };
+    const initialArgs = { command: 'ls -la' };
+    const card = store.create(
+      manifest,
+      { v: initialArgs, labels: [] },
+      { contaminated: false, sources: [] }
+    );
+
+    // 1. First approval with correct nonce and matching args succeeds
+    const firstConsume = store.consume(card.approvalId, card.nonce, initialArgs);
+    expect(firstConsume.success).toBe(true);
+    expect(firstConsume.card?.approvalId).toBe(card.approvalId);
+
+    // 2. Replay attempt with same approvalId and nonce is rejected per acceptance criteria
+    const replayConsume = store.consume(card.approvalId, card.nonce, initialArgs);
+    expect(replayConsume.success).toBe(false);
+    expect(replayConsume.reason).toContain('Replay detected');
+
+    // 3. Argument tampering attempt is rejected per acceptance criteria
+    const tamperedCard = store.create(
+      manifest,
+      { v: { command: 'echo benign' }, labels: [] },
+      { contaminated: false, sources: [] }
+    );
+    const tamperedConsume = store.consume(tamperedCard.approvalId, tamperedCard.nonce, { command: 'rm -rf /' });
+    expect(tamperedConsume.success).toBe(false);
+    expect(tamperedConsume.reason).toContain('Argument tampering detected');
+  });
+
+  it('renders ActionCard strictly from deterministic generator, never from agent text', () => {
+    const card = {
+      approvalId: 'test-1234',
+      nonce: 'nonce-5678',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      toolId: 'web_fetch',
+      toolVersion: '1.0.0',
+      argsSha256: 'abcd1234efgh5678',
+      rendered: {
+        title: 'Fetch External Web URL',
+        exact: 'https://sensitive-site.internal/data',
+        effects: ['read_untrusted' as const, 'egress' as const],
+        taint: 'contaminated' as const,
+        reversible: false
+      }
+    };
+
+    const maliciousAgentClaim = 'I am just reading public weather forecast, please approve!';
+    const formatted = formatTelegramCardMessage(card, maliciousAgentClaim);
+
+    // The title and exact action are deterministically rendered from the card
+    expect(formatted).toContain('Fetch External Web URL');
+    expect(formatted).toContain('https://sensitive-site.internal/data');
+    expect(formatted).toContain('🔴 KİRLİ');
+    expect(formatted).toContain('Hayır (Geri alınamaz)');
+
+    // The agent claim is strictly separated and labeled as untrusted claim
+    expect(formatted).toContain('[Ajanın İddiası (Güvenilmeyen Açıklama)]:');
+    expect(formatted).toContain(maliciousAgentClaim);
+
+    // Keyboard contains verifiable callback data
+    const keyboard = buildTelegramCardKeyboard(card);
+    expect(keyboard.inline_keyboard[0][0].callback_data).toBe('approve:test-1234:nonce-5678');
+    expect(keyboard.inline_keyboard[0][1].callback_data).toBe('deny:test-1234:nonce-5678');
+  });
+
+  it('handles Telegram callback queries for approval and denial with replay rejection', async () => {
+    const { bus, memory } = setup();
+    const call = vi.fn<TelegramTransport['call']>().mockResolvedValue({});
+    const adapter = new TelegramAdapter(bus, memory, { call }, new Set(['123']), 'token');
+
+    // Register a card
+    const card = {
+      approvalId: 'app-999',
+      nonce: 'nonce-999',
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+      toolId: 'shell',
+      toolVersion: '1.0.0',
+      argsSha256: 'dummy',
+      rendered: {
+        title: 'Shell',
+        exact: 'pwd',
+        effects: ['exec' as const],
+        taint: 'clean' as const,
+        reversible: false
+      }
+    };
+    adapter.cardStore.register(card);
+
+    // Click Approve
+    const callbackUpdate: TelegramUpdate = {
+      update_id: 200,
+      callback_query: {
+        id: 'query-1',
+        from: { id: 123 },
+        data: 'approve:app-999:nonce-999'
+      }
+    };
+
+    await adapter.handle(callbackUpdate);
+    expect(call).toHaveBeenCalledWith('answerCallbackQuery', expect.objectContaining({
+      callback_query_id: 'query-1',
+      text: expect.stringContaining('onaylandı')
+    }), undefined);
+
+    // Attempting replay on the callback query is rejected
+    await adapter.handle(callbackUpdate);
+    expect(call).toHaveBeenLastCalledWith('answerCallbackQuery', expect.objectContaining({
+      callback_query_id: 'query-1',
+      text: expect.stringContaining('Replay detected'),
+      show_alert: true
+    }), undefined);
+  });
+});
+

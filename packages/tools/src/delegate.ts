@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { AgentTool } from './index.js';
+import { DEFAULT_WORKSPACE_DIR } from './files.js';
 
 export interface DelegateRunner {
   (binary: string, args: string[], options: { cwd: string; timeout: number; signal?: AbortSignal }): Promise<{ stdout: string; stderr: string; exitCode: number }>;
@@ -16,7 +17,8 @@ export interface DelegateAgentToolOptions {
 }
 
 export function createDelegateAgentTool(options: DelegateAgentToolOptions = {}): AgentTool {
-  const workspaceDir = resolve(process.cwd(), options.workspaceDir || process.env.WORKSPACE_DIR || '.');
+  const defaultWs = resolve(process.cwd(), DEFAULT_WORKSPACE_DIR);
+  const workspaceDir = resolve(process.cwd(), options.workspaceDir || process.env.WORKSPACE_DIR || defaultWs);
   const defaultTimeoutMs = options.defaultTimeoutMs ?? 60_000;
   const maxTimeoutMs = options.maxTimeoutMs ?? 300_000;
   const maxOutputChars = options.maxOutputChars ?? 32_000;
@@ -44,6 +46,13 @@ export function createDelegateAgentTool(options: DelegateAgentToolOptions = {}):
   return {
     name: 'delegate_agent',
     description: 'Delegate a task to a local CLI agent (agy or codex). Requires approval and must be enabled via ENABLE_AGENT_DELEGATION=true.',
+    manifest: {
+      id: 'delegate_agent',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['exec', 'write_local'],
+      resources: { paths: [workspaceDir] }
+    },
     inputSchema: {
       type: 'object',
       properties: {

@@ -1,4 +1,5 @@
 import type { AgentTool } from './index.js';
+import { validateHostSSRF } from './fetch.js';
 
 export interface PageMock {
   goto(url: string, options?: { timeout?: number; waitUntil?: string }): Promise<unknown>;
@@ -35,6 +36,13 @@ export function createBrowserTool(options: BrowserToolOptions = {}): AgentTool {
   return {
     name: 'browser',
     description: 'Browse web pages using Playwright headless browser. Returns page title and text content.',
+    manifest: {
+      id: 'browser',
+      version: '1.0.0',
+      source: 'builtin',
+      effects: ['read_untrusted', 'egress'],
+      resources: {}
+    },
     inputSchema: {
       type: 'object',
       properties: {
@@ -65,6 +73,8 @@ export function createBrowserTool(options: BrowserToolOptions = {}): AgentTool {
       if (!['http:', 'https:'].includes(parsed.protocol)) {
         throw new Error(`Unsupported protocol: ${parsed.protocol}. Only HTTP and HTTPS are permitted.`);
       }
+
+      await validateHostSSRF(parsed.hostname);
 
       const reqTimeout = typeof input.timeoutMs === 'number' && Number.isFinite(input.timeoutMs) ? input.timeoutMs : defaultTimeoutMs;
       const effectiveTimeout = Math.min(Math.max(1000, reqTimeout), maxTimeoutMs);

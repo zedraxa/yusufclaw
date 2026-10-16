@@ -1,1 +1,1 @@
-{"extends":"./tsconfig.base.json","compilerOptions":{"composite":false,"noEmit":true},"include":["tests/**/*.ts"]}
+{"extends":"./tsconfig.base.json","compilerOptions":{"composite":false,"noEmit":true},"include":["tests/**/*.ts","evals/**/*.ts"]}
