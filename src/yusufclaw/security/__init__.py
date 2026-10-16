@@ -33,6 +33,11 @@ from yusufclaw.security.models import (
     ToolSource,
     Value,
 )
+from yusufclaw.security.telegram import (
+    build_telegram_card_keyboard,
+    format_telegram_card_message,
+    handle_telegram_callback_data,
+)
 
 __all__ = [
     "ActionCard",
@@ -52,8 +57,11 @@ __all__ = [
     "ToolResources",
     "ToolSource",
     "Value",
+    "build_telegram_card_keyboard",
     "canonical_json",
     "decide",
+    "format_telegram_card_message",
+    "handle_telegram_callback_data",
     "render_card",
     "sensitive_params_from_untrusted",
 ]
