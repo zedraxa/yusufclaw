@@ -5,6 +5,7 @@ Implements asynchronous message queue and background task dispatching using Redi
 - Routine execution queue with lock deduplication.
 - Pub/Sub message broker for real-time channel notifications.
 """
+from __future__ import annotations
 
 import redis.asyncio as aioredis
 
