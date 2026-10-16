@@ -6,7 +6,23 @@ Implements agent skill lifecycle and execution:
 - Skill evolution pipeline: task -> solve -> verify -> extract -> test -> version.
 - Skill repository management and isolation.
 
-Note: Logic will be ported from TypeScript packages/core and skills system.
+Note: Logic ported from TypeScript packages/core skills system.
 """
 
-__all__: list[str] = []
+from yusufclaw.skills.loader import (
+    MAX_DEPTH,
+    MAX_FILE_BYTES,
+    MAX_TOTAL_BYTES,
+    load_skills,
+    load_skills_sync,
+    loadSkills,
+)
+
+__all__ = [
+    "MAX_DEPTH",
+    "MAX_FILE_BYTES",
+    "MAX_TOTAL_BYTES",
+    "loadSkills",
+    "load_skills",
+    "load_skills_sync",
+]

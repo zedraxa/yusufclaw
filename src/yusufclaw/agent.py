@@ -67,6 +67,7 @@ class Agent:
         grants: Grants | None = None,
         card_store: ActionCardStore | None = None,
         approve_callback: ApproveCallback | None = None,
+        skills: str | None = None,
     ) -> None:
         if isinstance(memory, str):
             system_prompt = memory
@@ -75,6 +76,7 @@ class Agent:
         self.provider = provider
         self.memory = memory
         self.system_prompt = system_prompt
+        self.skills = skills
         self.tools = list(tools) if tools else []
         self.tool_executor = tool_executor
         self.max_steps = max_steps
@@ -149,7 +151,9 @@ class Agent:
             model_messages = self._convert_to_model_messages(state["messages"])
             session_id = state.get("session_id", "default")
 
-            system = self.system_prompt
+            system_parts = [self.system_prompt]
+            if self.skills:
+                system_parts.append(self.skills)
             if self.memory is not None:
                 user_text = ""
                 for msg in reversed(model_messages):
@@ -164,7 +168,8 @@ class Agent:
                     else:
                         mem_ctx = assemble_fn(session_id, user_text)
                     if mem_ctx:
-                        system = f"{self.system_prompt}\n\n{mem_ctx}"
+                        system_parts.append(mem_ctx)
+            system = "\n\n".join(system_parts)
 
             request = ModelRequest(
                 system=system,
