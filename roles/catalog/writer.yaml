@@ -1,0 +1,53 @@
+role_id: writer
+name: "Writer Specialist"
+description: "Technical documentation, email drafting, and executive report synthesis specialist. Prepares drafts but never directly sends external communications."
+aliases:
+  - documenter
+  - editor
+model_tier: strong
+allowed_tools:
+  - file_read
+  - file_write
+  - file_list
+  - recall
+allowed_mcp_servers:
+  - filesystem
+skills:
+  - technical-writing
+  - executive-summary
+  - copy-editing
+  - documentation-audit
+memory_scopes:
+  read:
+    - session
+    - docs
+    - templates
+    - styleguide
+  write:
+    - session
+risk_level: low
+approval_actions: []
+budget_limits:
+  max_tokens_per_turn: 8192
+  max_cost_per_turn: 0.50
+  max_steps_per_turn: 8
+sandbox_required: false
+sandbox_mode: none
+send_channels: []
+a2a_card:
+  name: writer
+  description: "Drafting specialist for documents, emails, and reports (never sends directly)"
+  version: "1.0.0"
+  capabilities:
+    - document_drafting
+    - report_synthesis
+    - content_polishing
+  skills:
+    - technical-writing
+    - executive-summary
+    - copy-editing
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text

@@ -1,0 +1,62 @@
+role_id: researcher
+name: "Researcher Specialist"
+description: "Academic and scientific literature research specialist. Deep-dives into arXiv, Semantic Scholar, and web repositories with rigorous citation and evidence verification."
+aliases:
+  - academic
+  - scholar
+model_tier: strong
+allowed_tools:
+  - web_fetch
+  - web_search
+  - paper_search
+  - arxiv_search
+  - file_read
+  - file_write
+  - recall
+  - remember
+allowed_mcp_servers:
+  - arxiv
+  - semanticscholar
+  - fetch
+skills:
+  - literature-review
+  - citation-verification
+  - comparative-analysis
+  - deep-research
+memory_scopes:
+  read:
+    - session
+    - academic
+    - papers
+    - citations
+  write:
+    - session
+    - research_notes
+risk_level: low
+approval_actions: []
+budget_limits:
+  max_tokens_per_turn: 16384
+  max_cost_per_turn: 1.00
+  max_steps_per_turn: 15
+sandbox_required: false
+sandbox_mode: none
+send_channels: []
+a2a_card:
+  name: researcher
+  description: "Scientific and academic deep research specialist with citation verification"
+  version: "1.0.0"
+  capabilities:
+    - literature_search
+    - paper_analysis
+    - citation_graph
+    - evidence_synthesis
+  skills:
+    - literature-review
+    - citation-verification
+    - deep-research
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card

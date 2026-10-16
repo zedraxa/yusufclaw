@@ -1,0 +1,70 @@
+role_id: coder
+name: "Coder Specialist"
+description: "Codex-style software engineering specialist. Edits codebases, executes test suites, performs git operations, and prepares PRs strictly within a sandbox."
+aliases:
+  - developer
+  - programmer
+model_tier: strong
+allowed_tools:
+  - file_read
+  - file_write
+  - file_list
+  - file_delete
+  - shell
+  - git_status
+  - git_diff
+  - git_commit
+  - git_push
+  - pr_create
+  - test_runner
+  - recall
+  - remember
+allowed_mcp_servers:
+  - filesystem
+  - git
+skills:
+  - code-refactor
+  - test-driven-development
+  - git-flow
+  - bug-localization
+memory_scopes:
+  read:
+    - session
+    - repo
+    - project
+    - codebase
+  write:
+    - session
+    - project
+risk_level: high
+approval_actions:
+  - git_push
+  - pr_create
+  - shell_destroy
+  - sudo
+budget_limits:
+  max_tokens_per_turn: 16384
+  max_cost_per_turn: 1.50
+  max_steps_per_turn: 20
+sandbox_required: true
+sandbox_mode: auto
+send_channels: []
+a2a_card:
+  name: coder
+  description: "Sandboxed repository intelligence and test execution specialist"
+  version: "1.0.0"
+  capabilities:
+    - code_editing
+    - testing
+    - git_operations
+    - sandboxed_execution
+  skills:
+    - code-refactor
+    - test-driven-development
+    - git-flow
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card

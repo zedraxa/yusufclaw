@@ -1,0 +1,65 @@
+role_id: orchestrator
+name: "Orchestrator Assistant"
+description: "Grok Bot-style master personal assistant. Coordinates routines, plans complex tasks, delegates to specialist subagents, and manages long-term memory."
+aliases:
+  - assistant
+  - coordinator
+model_tier: strong
+allowed_tools:
+  - delegate_agent
+  - plan_and_execute
+  - remember
+  - recall
+  - revise
+  - forget
+  - routine_create
+  - routine_list
+  - routine_delete
+  - current_time
+  - send_message
+allowed_mcp_servers: []
+skills:
+  - task-planning
+  - delegation-management
+  - routine-automation
+  - memory-consolidation
+memory_scopes:
+  read:
+    - "*"
+  write:
+    - session
+    - global
+    - routines
+risk_level: medium
+approval_actions:
+  - delegate_high_risk
+  - spend
+budget_limits:
+  max_tokens_per_turn: 16384
+  max_cost_per_turn: 1.00
+  max_steps_per_turn: 15
+sandbox_required: false
+sandbox_mode: none
+send_channels:
+  - web
+  - telegram
+  - cli
+a2a_card:
+  name: orchestrator
+  description: "Master coordinator and personal assistant for planning, routines, and delegation"
+  version: "1.0.0"
+  capabilities:
+    - task_planning
+    - subagent_delegation
+    - routine_management
+    - memory_consolidation
+  skills:
+    - task-planning
+    - delegation-management
+    - routine-automation
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card

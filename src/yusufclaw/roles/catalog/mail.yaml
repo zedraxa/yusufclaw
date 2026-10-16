@@ -1,0 +1,63 @@
+role_id: mail
+name: "Mail Specialist"
+description: "Inbox management specialist. Reads, triages, classifies, summarizes, and drafts inbox replies. Sending any email strictly requires explicit human approval."
+aliases:
+  - email
+  - inbox
+model_tier: cheap
+allowed_tools:
+  - mail_read
+  - mail_triage
+  - mail_summarize
+  - mail_draft
+  - mail_send
+  - recall
+  - remember
+allowed_mcp_servers:
+  - email
+  - contacts
+skills:
+  - inbox-zero
+  - email-classification
+  - urgent-triage
+  - response-drafting
+memory_scopes:
+  read:
+    - inbox
+    - contacts
+    - session
+    - vip_list
+  write:
+    - session
+    - triage_notes
+risk_level: medium
+approval_actions:
+  - mail_send
+  - mail_delete
+budget_limits:
+  max_tokens_per_turn: 8192
+  max_cost_per_turn: 0.30
+  max_steps_per_turn: 8
+sandbox_required: false
+sandbox_mode: none
+send_channels:
+  - email
+a2a_card:
+  name: mail
+  description: "Inbox reader, triager, and drafting assistant (sending requires human approval)"
+  version: "1.0.0"
+  capabilities:
+    - email_triage
+    - inbox_summary
+    - reply_drafting
+    - approval_gated_send
+  skills:
+    - inbox-zero
+    - email-classification
+    - response-drafting
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card

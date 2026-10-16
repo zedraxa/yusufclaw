@@ -1,0 +1,66 @@
+role_id: ops
+name: "DevOps & Cloud Specialist"
+description: "Cloud infrastructure and DevOps specialist. Operates in validate-only mode by default; infrastructure deployments, modifications, and deletions strictly require human approval."
+aliases:
+  - devops
+  - infra
+  - sre
+model_tier: strong
+allowed_tools:
+  - aws_read
+  - aws_describe
+  - infra_validate
+  - cdk_synth
+  - cdk_diff
+  - infra_deploy
+  - shell
+allowed_mcp_servers:
+  - aws
+  - kubernetes
+skills:
+  - cdk-synthesizer
+  - infra-audit
+  - security-compliance
+  - cost-optimizer
+memory_scopes:
+  read:
+    - session
+    - infra
+    - config
+    - architecture
+  write:
+    - session
+    - infra_audit
+risk_level: critical
+approval_actions:
+  - infra_deploy
+  - cdk_deploy
+  - aws_write
+  - resource_delete
+  - iam_modify
+budget_limits:
+  max_tokens_per_turn: 16384
+  max_cost_per_turn: 1.50
+  max_steps_per_turn: 15
+sandbox_required: true
+sandbox_mode: auto
+send_channels: []
+a2a_card:
+  name: ops
+  description: "Cloud infrastructure specialist (validate-only by default, deployments require approval)"
+  version: "1.0.0"
+  capabilities:
+    - infra_validation
+    - cdk_synthesis
+    - cloud_diff
+    - approval_gated_deploy
+  skills:
+    - cdk-synthesizer
+    - infra-audit
+    - cost-optimizer
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card

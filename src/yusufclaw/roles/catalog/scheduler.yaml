@@ -1,0 +1,66 @@
+role_id: scheduler
+name: "Scheduler Specialist"
+description: "Calendar, reminder, and agenda management specialist. Schedules events, detects time conflicts, configures reminders, and organizes routine agendas."
+aliases:
+  - calendar
+  - reminders
+model_tier: cheap
+allowed_tools:
+  - calendar_read
+  - calendar_create
+  - calendar_delete
+  - reminder_set
+  - reminder_list
+  - current_time
+  - remember
+  - recall
+allowed_mcp_servers:
+  - google_calendar
+  - caldav
+skills:
+  - time-scheduling
+  - conflict-resolution
+  - reminder-tracking
+  - daily-briefing
+memory_scopes:
+  read:
+    - calendar
+    - reminders
+    - session
+    - agenda
+  write:
+    - calendar
+    - reminders
+    - session
+risk_level: low
+approval_actions:
+  - calendar_delete
+  - calendar_invite_external
+budget_limits:
+  max_tokens_per_turn: 4096
+  max_cost_per_turn: 0.20
+  max_steps_per_turn: 6
+sandbox_required: false
+sandbox_mode: none
+send_channels:
+  - telegram
+  - web
+a2a_card:
+  name: scheduler
+  description: "Calendar and reminder specialist for personal schedule management"
+  version: "1.0.0"
+  capabilities:
+    - calendar_management
+    - reminders
+    - time_tracking
+    - conflict_detection
+  skills:
+    - time-scheduling
+    - conflict-resolution
+    - reminder-tracking
+  input_modes:
+    - text
+    - json
+  output_modes:
+    - text
+    - action_card
