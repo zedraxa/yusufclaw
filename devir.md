@@ -922,7 +922,32 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
 - `ReversibleActionLog`: intent+outcome (komut hash, backend, exit); ham komut/env/çıktı saklanmaz. Keyfi komutlar geri alınamaz olarak belgelenir.
 - Doğrulama: `uv run pytest -q` → **273 passed**; ruff temiz; mypy src (85 dosya) temiz. Mock/skip ile bwrap/podman gerekmez. Kullanım: `docs/PY-SANDBOX.md`. Agent/models/gateway/roles/queue/memory/evals değiştirilmedi. AWS yok; push yapılmadı. §22 evals için ayrılmıştır.
 
-## 24. AWS Dağıtımı (infra_py) — `py-deploy` Dalı
+## 24. Python Writer Delegeleri (External Coding CLIs) — `py-writers` Dalı
+
+- Yeni `src/yusufclaw/writers/` paketi: Harici kodlama CLI'larını (`agy`, `codex`) izole, sınırlı ve denetimli alt işler olarak çalıştıran delege adaptörü (P2-01, YC-24).
+- `CLIProtocolProbe`: `--version` denetimi ve semver ayrıştırması ile CLI ikilisinin varlığını ve çalışabilirlik protokolünü doğrular; bulunamayan veya hata veren ikililer fail-closed olarak erken aşamada reddedilir.
+- `WorkspaceManager`: Yapılandırılabilir üst dizin altında (`YUSUFCLAW_WRITERS_WORKSPACE_DIR`, varsayılan `/tmp/yusufclaw-worktrees`, `0o700` izinli) izole git worktree yaşam döngüsü (`git worktree add --detach` veya geçici dal). `validate_workspace_path` ile dizin dışına taşma (`../`) ve symlink kaçışları engellenir. İş tamamlandığında veya iptal edildiğinde worktree ve geçici dal otomatik temizlenir (`git worktree remove --force` + `prune`).
+- Güvenlik ve Ortam Arındırma (`scrub_environment`): Alt süreçler üst süreçteki hiçbir gizli bilgiyi (AWS, OpenAI, Anthropic, Gemini, GitHub, SSH, Database, Redis, Telegram, YusufClaw token/key) devralmaz. Yalnızca izinli güvenli ortam değişkenleri aktarılır ve deterministik git kimliği eklenir. `env_overrides` üzerinden gizli anahtar enjeksiyonu `SecurityViolationError` ile engellenir.
+- `ChildBudget`: Süre (`max_time_seconds`, varsayılan 120s), çıktı tamponu (`max_output_bytes`, varsayılan 1MB) ve değişen dosya adedi (`max_changed_files`, varsayılan 100) tavanları uygulanır.
+- Eşzamanlılık ve Derinlik (P2-02): Derinlik kesin olarak 1 ile sınırlıdır (`depth <= 1`); alt delegelerin özyinelemeli alt delege başlatması yasaktır. En fazla iki eşzamanlı alt süreç (`MAX_CONCURRENT_CHILDREN = 2`) `asyncio.Semaphore(2)` ile denetlenir; aşan talepler kuyruğa alınır.
+- Ebeveyn Doğrulama Kancası (`WriterVerifier`): Bir delege işi yalnızca CLI çıkış kodu 0 olduğu için başarılı sayılmaz. Delege tamamlandıktan sonra worktree içinde ebeveyn doğrulama testi (varsayılan sanal ortam pytest'i veya `spec.test_command`) çalıştırılır; test başarısızsa veya zaman aşımına uğrarsa iş başarısız işaretlenir (`test_passed=False`).
+- Yapılandırılmış Sonuç (`WriterResult`): Çıkış kodu, özet metin, `git status --porcelain` ve `git diff --name-only` ile toplanan göreceli değişen dosya yolları (`changed_paths`), test çıktısı, süre ve hata/çakışma/iptal bayrakları döndürülür.
+- Çift Çalıştırma Kipi: `YUSUFCLAW_QUEUE_ENABLED=1` olduğunda `JobQueue` üzerinde `kind="writer"`, `role="writer"` alt işi olarak enqueue edilir ve `parent_id` ile hiyerarşik bağlanır; aksi halde eşzamanlılık semaforu ve izole süreç grubu (`start_new_session=True`) ile inline `asyncio` subprocess olarak yürütülür.
+- İptal ve Çakışma: `asyncio.CancelledError` veya kuyruk iptali durumunda süreç grubuna `SIGTERM` gönderilir (`os.killpg`), worktree temizlenir ve `cancelled=True` bayrağı atanır. Çakışan çalışma dizinleri `WorkspaceConflictError` üretir.
+- Doğrulama: `uv run pytest -q && uv run ruff check . && uv run mypy src` → **305 passed, 1 skipped, 1 xfailed**; ruff temiz; strict mypy temiz (92 kaynak dosyasında hata yok). Çevrimdışı test süiti `tests/python/test_writers.py` (25 test) canlı ağ veya bulut kimliği gerektirmez. Kullanım: `docs/PY-WRITERS.md`. Agent core, models, gateway, roles, coordination, memory, sandbox, evals değiştirilmedi. AWS yok; push yapılmadı. §§1–23 korunmuştur.
+
+## 25. Python A2A Teammate Substrate ve Ayrık Veri Kanalları — `py-a2a` Dalı
+
+- Yeni `src/yusufclaw/a2a/` paketi: Agent-to-Agent 1.0 tarzı yerel takım arkadaşı protokolü (Google A2A bulut bağımlılığı olmadan aynı host üzerinde). Pydantic modelleri (`AgentCard`, `TeammateBudget`, `TaskRequest`, `TaskResult`, `ContextArtifact`), olaylar (`TeammateEvent`) ve `A2ATransport` protokolü.
+- Ayrık Veri Kanalları (Segregated Data Channels): Alt ajan koordinatörün tam oturum ve olgusal belleğini (`SqliteMemory`, `PostgresMemory`, profile facts, turn geçmişi) kesinlikle okuyamaz; yalnızca `TaskRequest.context_artifacts` ile açıkça aktarılan veri nesnelerine erişebilir. Güvenilmeyen veri kanalı etiketlemesi ile CaMeL / FIDES prompt enjeksiyon izolasyonu ve `IsolatedChildMemory` sağlandı.
+- Derinlik-1 ve Eşzamanlılık Yönetimi: `TeammateRegistry` yalnızca derinlik-1 alt ajanları takip eder; torun ajan oluşturma denemeleri (`depth > 1` veya çocuk ajan üzerinden alt ajan çağırma) fail-closed olarak `DepthLimitExceededError` ile engellenir. Ebeveyn başına azami 3 eşzamanlı çalışan sınırı (`ConcurrencyLimitExceededError`) uygulanır.
+- Çocuk Başına Bütçe ve İptal Yayılımı: Her çocuk görev için bağımsız token, adım, süre ve maliyet tavanları (`TeammateBudget`) enforced edilir; ebeveyn görevi iptal edildiğinde (`cancel_parent`), altındaki tüm aktif çocuk görevler derhal iptal edilir.
+- Taşıma Katmanları (Transports): Sıfır ağ maliyetli bellek içi `InProcessTransport` ve yerel decoupled süreçler için loopback `HttpJsonTransport` (`httpx.AsyncClient` + `create_a2a_router` FastAPI APIRouter adaptörü).
+- UX-12 Telemetri Kancası: `SubagentRunner` içine ince kanca (`TeammateStatusHook`) bağlandı; web görselleştiricisi inşa edilmeden AG-UI UX-12 olayları (`teammate.spawned`, `teammate.step`, `teammate.finished`) yayınlanır.
+- Testler ve Doğrulama: `tests/python/test_a2a.py` içinde 19 çevrimdışı test; veri kanalı izolasyonu, derinlik-1, bütçe tavanları, ASGI loopback HTTP, iptal yayılımı ve kanca olayları doğrulandı.
+- Kalite ve Regresyon Kapısı: `uv run pytest -q` → **299 passed, 1 skipped, 1 xfailed**; `uv run ruff check .` → temiz; `uv run mypy src` → **93 kaynak dosyasında 0 hata**. Kullanım: `docs/PY-A2A.md`. `agent.py` çekirdeği, `models/`, `gateway/web.py` UI, rol YAML'ları, `writers/`, `memory/`, `sandbox/`, `evals/` ve queue store çekirdeği değiştirilmedi; AWS kullanılmadı; push yapılmadı. §24 writer delegeleri için ayrılmıştır.
+
+## 26. AWS Dağıtımı (infra_py) — `py-deploy` Dalı
 
 **Durum (2026-10-16):** Kod dağıtıma hazır, testler geçiyor; **`cdk bootstrap` henüz yapılmadı** çünkü root (`default`) profil oturumu süresi dolmuş (`aws login` gerekiyor) ve `yusufclaw-agent` kullanıcısının IAM rol oluşturma yetkisi yok. Bu yüzden `cdk deploy` çalıştırılmadı; aşağıdaki çıktılar dağıtımdan sonra doldurulacak.
 
@@ -955,3 +980,4 @@ cdk deploy --all --require-approval never --profile yusufclaw
 cd infra_py && cdk destroy --all --force --profile yusufclaw
 # DynamoDB tablosu ve S3 bucket RETAIN politikasındadır; gerekirse elle silin.
 ```
+||||||| a9c30f8

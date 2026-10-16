@@ -34,6 +34,7 @@ from yusufclaw.orchestration.verifier import Verifier
 from yusufclaw.queue import Job, Worker, default_queue, queue_enabled
 from yusufclaw.security import Grants
 from yusufclaw.telemetry import get_tracer
+from yusufclaw.writers import WriterDelegateRunner, WriterResult, WriterSpec
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class AdaptiveOrchestrator:
         router: ModelRouter | None = None,
         providers: Mapping[str, ModelProvider] | None = None,
         user_id: str = "local",
+        writer_runner: WriterDelegateRunner | None = None,
     ) -> None:
         self.user_id = user_id
         self.config = config or OrchestrationConfig(enabled=True)
@@ -116,6 +118,11 @@ class AdaptiveOrchestrator:
             available_tools=self.tools,
             router=self.router,
         )
+        self.writer_runner = writer_runner or WriterDelegateRunner()
+
+    async def run_writer(self, spec: WriterSpec) -> WriterResult:
+        """Run an isolated coding CLI writer delegate."""
+        return await self.writer_runner.run(spec)
 
     async def handle_job(self, job: Job) -> dict[str, str]:
         """Restartable orchestration handler using this instance's trusted provider/grants."""

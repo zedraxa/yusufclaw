@@ -15,15 +15,17 @@ Implements bounded subagent workers following the architecture principles:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from yusufclaw.a2a.events import TeammateEvent
 from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import (
     Message,
@@ -73,6 +75,7 @@ class SubagentRunner:
         durable: bool | None = None,
         user_id: str = "local",
         parent_job_id: str | None = None,
+        teammate_hook: Callable[[TeammateEvent], Awaitable[None] | None] | Any = None,
     ) -> None:
         self.job_queue = job_queue
         self.durable = queue_enabled() if durable is None else durable
@@ -85,6 +88,21 @@ class SubagentRunner:
         self.parent_grants = parent_grants
         self.budget_manager = budget_manager
         self.use_deep_agents = use_deep_agents and DEEP_AGENTS_AVAILABLE
+        self.teammate_hook = teammate_hook
+
+    async def _emit_teammate_event(self, event: TeammateEvent) -> None:
+        """Publish a teammate event to the registered hook or listeners."""
+        if self.teammate_hook is None:
+            return
+        try:
+            if hasattr(self.teammate_hook, "emit"):
+                await self.teammate_hook.emit(event)
+            else:
+                res = self.teammate_hook(event)
+                if inspect.isawaitable(res):
+                    await res
+        except Exception as e:
+            logger.warning("Error emitting teammate event: %s", e)
 
     def _filter_permitted_tools(self, permitted_names: Sequence[str]) -> list[ToolDefinition]:
         """Compute least-privilege tool intersection between parent and requested tools."""
@@ -210,6 +228,23 @@ class SubagentRunner:
             worker_tools = self._filter_permitted_tools(spec.permitted_tools)
             worker_tools_map = {t.name: t for t in worker_tools}
 
+            # Emit teammate.spawned event (UX-12)
+            max_cost: float | None = None
+            if bm is not None:
+                max_cost = bm.limits.max_cost_per_turn
+
+            await self._emit_teammate_event(
+                TeammateEvent(
+                    event_type="teammate.spawned",
+                    subagent_id=spec.name,
+                    parent_run_id=self.parent_job_id,
+                    role=spec.model_role,
+                    task=spec.instruction,
+                    tools=[t.name for t in worker_tools],
+                    max_cost=max_cost,
+                )
+            )
+
             # Build separate prompt channels: Instruction is trusted, ContextData is untrusted data
             system_parts = [
                 f"You are subagent '{spec.name}', a focused specialist worker for YusufClaw.",
@@ -284,6 +319,17 @@ class SubagentRunner:
                 if bm is not None:
                     bm.record_tokens(prompt_toks, comp_toks)
                     bm.record_step(1)
+
+                await self._emit_teammate_event(
+                    TeammateEvent(
+                        event_type="teammate.step",
+                        subagent_id=spec.name,
+                        parent_run_id=self.parent_job_id,
+                        step=steps_taken,
+                        summary=resp.text[:100] if resp.text else f"Step {steps_taken} completed",
+                        tokens=total_tokens,
+                    )
+                )
 
                 lc_tcs: list[dict[str, Any]] = [
                     {"name": tc.name, "args": tc.input, "id": tc.id} for tc in resp.tool_calls
@@ -391,6 +437,21 @@ class SubagentRunner:
                         "yusufclaw.routing.role", spec.model_role or ModelRole.DEFAULT.value
                     )
                     span.set_attribute("yusufclaw.routing.provider", p_name)
+
+            # Emit teammate.finished event (UX-12)
+            cost_usd: float | None = None
+            if bm is not None:
+                cost_usd = bm.turn_usage.cost
+
+            await self._emit_teammate_event(
+                TeammateEvent(
+                    event_type="teammate.finished",
+                    subagent_id=spec.name,
+                    parent_run_id=self.parent_job_id,
+                    status="success" if result.success else "failed",
+                    cost_usd=cost_usd,
+                )
+            )
 
             return result
 

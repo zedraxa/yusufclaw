@@ -36,6 +36,7 @@ from yusufclaw.orchestration.planner import PlanAndExecuteWorkflow
 from yusufclaw.orchestration.subagent import DEEP_AGENTS_AVAILABLE, SubagentRunner
 from yusufclaw.orchestration.task_analyzer import TaskAnalyzer
 from yusufclaw.orchestration.verifier import Verifier
+from yusufclaw.writers import WriterDelegateRunner, WriterResult, WriterSpec
 
 __all__ = [
     "DEEP_AGENTS_AVAILABLE",
@@ -54,11 +55,14 @@ __all__ = [
     "PlanStep",
     "RiskLevel",
     "SubagentResult",
-    "SubagentSpec",
     "SubagentRunner",
+    "SubagentSpec",
     "TaskAnalysis",
     "TaskAnalyzer",
     "TokenPricing",
     "VerificationResult",
     "Verifier",
+    "WriterDelegateRunner",
+    "WriterResult",
+    "WriterSpec",
 ]
