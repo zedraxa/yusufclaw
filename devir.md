@@ -553,3 +553,48 @@ Bu dal (`phase3-memory`), SPEC.md ve DESIGN tavsiyelerinde (P0-07 ve P1-02/P1-03
   - `packages/` (TypeScript), `gateway/`, `security/`, `memory/`, `skills/`, `routines/`, `tools/`, `models/` ve `infra_py/` %100 temiz ve dokunulmamıştır.
 - **Kılavuz Belgesi**: `PY-ORCH.md`.
 
+---
+
+## 13. Python MCP İstemcisi, Rootless Sandbox ve Beceri Yaşam Döngüsü — `py-mcp` Dalı
+
+### 13.1 Genel Mimari ve Kararlar
+- `docs/ARCHITECTURE-v2.md` Katman 6 (Skills: task -> solve -> test -> extract method -> skill -> retest -> version git; pinning + quarantine), Katman 7 (Tools: MCP resmi SDK; >30 araçta dinamik seçim) ve Katman 8 (Verification & governance: rootless-container sandbox, limits, reversible action log) hedefleri eksiksiz olarak `src/yusufclaw/mcp/`, `src/yusufclaw/sandbox/` ve `src/yusufclaw/skills/lifecycle.py` altında uygulanmıştır.
+- **Kapsam ve İzolasyon Güvencesi**:
+  - Kesinlikle dokunulmayan modüller: `agent.py`, `gateway/`, `security/`, `memory/`, `routines/`, `telemetry/`, `models/`, `infra_py/`, `src/yusufclaw/tools/*.py` ve `packages/` (TypeScript).
+  - `src/yusufclaw/skills/loader.py` dosyasına **kesinlikle dokunulmamış**; beceri yaşam döngüsü bağımsız olarak `src/yusufclaw/skills/lifecycle.py` içinde kurgulanmıştır.
+- **Offline ve Sıfır Dış Bağımlılık Garantisi**:
+  - Tüm MCP testleri yerel stdio alt süreç mock sunucusu (`MCPServer`) ile 100% offline çalıştırılmıştır.
+  - Sandbox testleri ortamda yetkisiz kullanıcı ad alanları (unprivileged user namespaces) veya rootless konteyner bulunmadığında otomatik olarak güvenle atlanmakta (`skipif`), fail-closed denied fallback mimarisi doğrulanmaktadır.
+
+### 13.2 Gerçekleştirilen Bileşenler
+1. **Resmi Python SDK Destekli MCP İstemcisi (`src/yusufclaw/mcp/`)**:
+   - `models.py`: `MCPServerConfig` (stdio command/args/env/cwd ve remote streamable HTTP / SSE url/headers desteği, sürüm sabitleme, `pinned_hash`, karantina bayrağı), `MCPConfig` dosya ve sözlük yükleyicisi, `ServerPinRecord`.
+   - `pinning.py`: `compute_tools_hash` (araç adı, açıklama ve girdi şemasını kanonik JSON ile deterministik SHA-256 özetine dönüştürür), `PinningStore` (`mcp.lock.json` takibi). Araç açıklaması zehirlenmesi (description poisoning) veya yeni unpinned sunucu tespit edildiğinde sunucu otomatik olarak `quarantined` durumuna alınır.
+   - `client.py`: Resmi `mcp` SDK v2.3.0 (`ClientSession`, `stdio_client`, `streamable_http_client`, `sse_client`) sarmalayıcısı; zaman aşımı ve metin çıktısı ayrıştırma.
+   - `adapter.py`: MCP araçlarını YusufClaw `GuardedTool` arayüzüne uyarlar. `ToolManifest(source="mcp", effects=["read_untrusted"])` üretir. Karantinadaki sunucuların yürütülmesi fail-closed olarak engellenir (`QuarantinedServerError`).
+   - `selection.py`: `DynamicToolSelector` ve `select_tools_for_query`. Araç sayısı 30'u aştığında RAG-MCP tarzı BM25 / token benzerlik puanlamasıyla sorguyla en alakalı top-$k$ (varsayılan 10) aracı dinamik olarak seçer, çekirdek araçları (`always_include`) korur ve model bağlamı şişmesini (prompt bloat) önler.
+2. **Rootless Sandbox Koşucusu ve Geri Alınabilir Eylem Günlüğü (`src/yusufclaw/sandbox/`)**:
+   - `models.py`: `SandboxConfig` (512MB RAM, 1.0 CPU kotası, 30s zaman aşımı, 64KB çıktı kesintisi, varsayılan kapalı ağ), `SandboxResult`, `ActionLogEntry`, `UndoResult`.
+   - `runner.py`: `SandboxRunner` soyut arayüzü; `BubblewrapRunner` (`bwrap --unshare-net --unshare-ipc --unshare-pid --unshare-uts --ro-bind /usr ... --bind workspace ... --tmpfs /tmp`); `RootlessContainerRunner` (Podman / Docker rootless `--network none --memory --cpus --read-only`); `DeniedFallbackRunner` (sandbox bulunmadığında ana sistemi riske atmamak için çalıştırmayı fail-closed olarak reddeden çıkış kodu 126 kapısı); `get_sandbox_runner` otomatik tespit fabrikası.
+   - `action_log.py`: `ReversibleActionLog` ile append-only JSONL formatında eylem günlüğü (`.data/workspace/.yusufclaw_actions.jsonl`). Her yan etki UUID, zaman damgası, araç adı, eylem türü, hedef ve geri alma ipucu (`undo_hint`: `delete_file`, `restore_file`, `remove_dir`) ile kaydedilir. `undo()` çağrıldığında ters işlem uygulanır ve olay kaynaklı (event-sourced) tazminat kaydı düşülerek mükerrer geri almalar engellenir.
+3. **7-Aşamalı Beceri Yaşam Döngüsü Hattı (`src/yusufclaw/skills/lifecycle.py`)**:
+   - Pipeline Akışı: `task -> solve -> test -> extract -> skill -> retest -> version (git-backed)`.
+   - `TaskSpec`: Hedef, istem ve kabul kriterleri.
+   - `TaskSolution`: Gözlemlenen çözüm adımları, çıktı ve metodoloji.
+   - `VerificationResult`: Kriter uygunluk doğrulaması ve puanı.
+   - `SkillCandidate`: YAML frontmatter (`name`, `description`, `allowed-tools`, `version`, `resources`) ve yapılandırılmış markdown gövdesi ile beceri sentezi.
+   - `skill`: `skills/quarantine/{name}/SKILL.md` altına taslak/karantina durumunda SHA-256 özetiyle yazım.
+   - `retest`: Aday beceri enjekte edilerek görevin baştan çözülebilirliğinin doğrulanması (başarısızlıkta `rejected` durumunda karantinada kalır).
+   - `version`: Doğrulanan beceriyi `skills/{name}/SKILL.md` altına yükseltir, `skills.lock` içine SHA-256 sabitlemesi yapar ve git reposunda commit oluşturarak commit SHA'sını kaydeder.
+   - `SkillLock`: `skills.lock` dosyasında beceri sabitlemesi ve tahrifat denetimi (`hash_mismatch`).
+
+### 13.3 Test ve Doğrulama
+- **Eklenen Test Dosyaları**:
+  - `tests/python/test_mcp.py` (5 senaryo: config, canonical hash determinizmi, pinning/karantina, offline mock stdio MCP sunucu tam döngüsü, >30 dinamik araç seçimi).
+  - `tests/python/test_sandbox.py` (7 senaryo: config sınırları, bwrap komut inşası, rootless container komut inşası, denied fallback fail-closed, runner tespiti, bwrap izolasyon probe, append-only geri alınabilir eylem günlüğü yaşam döngüsü).
+  - `tests/python/test_skill_lifecycle.py` (4 senaryo: frontmatter biçimlendirme, `SkillLock` tahrifat tespiti, 7-aşamalı git commitli tam pipeline döngüsü, retest başarısızlığında karantinada kalma).
+- **Sonuçlar**:
+  - `uv run pytest`: **119 passed, 1 skipped** (18.94s, 21 test dosyasında 120 test, 0 hata).
+  - `uv run ruff check .`: 0 hata, 0 uyarı (`All checks passed!`).
+  - `uv run mypy src`: 60 kaynak dosyasında tam strict modda 0 hata.
+- **Kılavuz Belgesi**: `PY-MCP.md`.
