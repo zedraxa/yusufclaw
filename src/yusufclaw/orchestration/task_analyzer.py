@@ -18,6 +18,7 @@ import logging
 import re
 from collections.abc import Sequence
 
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ToolDefinition
 from yusufclaw.orchestration.models import (
     ComplexityLevel,
@@ -167,8 +168,10 @@ class TaskAnalyzer:
         self,
         provider: ModelProvider | None = None,
         available_tools: Sequence[ToolDefinition | str] | None = None,
+        router: ModelRouter | None = None,
     ) -> None:
         self.provider = provider
+        self.router = router
         self.available_tool_names: list[str] = []
         if available_tools:
             for t in available_tools:
@@ -275,7 +278,11 @@ class TaskAnalyzer:
 
     async def analyze_model(self, prompt: str) -> TaskAnalysis:
         """Classifies the task using the model provider, falling back to heuristics on error."""
-        if self.provider is None:
+        active_provider = self.provider
+        if self.router is not None:
+            active_provider = self.router.get_provider(ModelRole.CLASSIFY)
+
+        if active_provider is None:
             return self.analyze_heuristic(prompt)
 
         system_instruction = (
@@ -302,7 +309,7 @@ class TaskAnalyzer:
         )
 
         try:
-            resp = await self.provider.complete(req)
+            resp = await active_provider.complete(req)
             raw_text = resp.text.strip()
             # Handle markdown code blocks
             if "```" in raw_text:
@@ -332,7 +339,8 @@ class TaskAnalyzer:
         """Analyze the task and record OpenTelemetry telemetry span."""
         tracer = get_tracer("yusufclaw.orchestration")
         with tracer.start_as_current_span("yusufclaw.orchestration.task_analysis") as span:
-            if model_assisted and self.provider is not None:
+            has_provider = self.provider is not None or self.router is not None
+            if model_assisted and has_provider:
                 analysis = await self.analyze_model(prompt)
             else:
                 analysis = self.analyze_heuristic(prompt)
@@ -344,6 +352,10 @@ class TaskAnalyzer:
                 span.set_attribute("yusufclaw.task.plan_required", analysis.plan_required)
                 span.set_attribute("yusufclaw.task.delegate_required", analysis.delegate_required)
                 span.set_attribute("yusufclaw.task.estimated_steps", analysis.estimated_steps)
+                if self.router is not None and model_assisted and has_provider:
+                    _, p_name, _ = self.router.route(ModelRole.CLASSIFY)
+                    span.set_attribute("yusufclaw.routing.role", ModelRole.CLASSIFY.value)
+                    span.set_attribute("yusufclaw.routing.provider", p_name)
 
             return analysis
 

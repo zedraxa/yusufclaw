@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import (
     Message,
     ModelProvider,
@@ -64,8 +65,10 @@ class SubagentRunner:
         parent_grants: Grants | None = None,
         budget_manager: BudgetManager | None = None,
         use_deep_agents: bool = True,
+        router: ModelRouter | None = None,
     ) -> None:
         self.provider = provider
+        self.router = router
         self.parent_tools = list(parent_tools) if parent_tools else []
         self.parent_tools_map = {t.name: t for t in self.parent_tools}
         self.parent_grants = parent_grants
@@ -145,6 +148,11 @@ class SubagentRunner:
             total_tokens = 0
             steps_taken = 0
 
+            # Resolve model provider for subagent role
+            worker_provider = self.provider
+            if self.router is not None:
+                worker_provider = self.router.get_provider(spec.model_role or ModelRole.DEFAULT)
+
             async def worker_model_node(state: SubagentWorkerState) -> dict[str, Any]:
                 nonlocal total_tokens, steps_taken
                 model_msgs: list[Message] = []
@@ -184,7 +192,7 @@ class SubagentRunner:
                     tools=worker_tools,
                     max_tokens=spec.max_tokens,
                 )
-                resp = await self.provider.complete(req)
+                resp = await worker_provider.complete(req)
 
                 prompt_toks = resp.usage.get("prompt_tokens", 10)
                 comp_toks = resp.usage.get("completion_tokens", 10)
@@ -297,6 +305,10 @@ class SubagentRunner:
                 span.set_attribute("yusufclaw.subagent.success", result.success)
                 span.set_attribute("yusufclaw.subagent.tokens_used", result.tokens_used)
                 span.set_attribute("yusufclaw.subagent.steps_used", result.steps_used)
+                if self.router is not None:
+                    _, p_name, _ = self.router.route(spec.model_role or ModelRole.DEFAULT)
+                    span.set_attribute("yusufclaw.routing.role", spec.model_role or ModelRole.DEFAULT.value)
+                    span.set_attribute("yusufclaw.routing.provider", p_name)
 
             return result
 

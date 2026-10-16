@@ -18,6 +18,7 @@ import logging
 import re
 from collections.abc import Sequence
 
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import Message, ModelProvider, ModelRequest
 from yusufclaw.orchestration.models import AcceptanceCriteria, VerificationResult
 from yusufclaw.telemetry import get_tracer
@@ -28,8 +29,13 @@ logger = logging.getLogger(__name__)
 class Verifier:
     """Validates candidate responses against acceptance criteria and manages retries."""
 
-    def __init__(self, provider: ModelProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider | None = None,
+        router: ModelRouter | None = None,
+    ) -> None:
         self.provider = provider
+        self.router = router
 
     async def _evaluate_model_judge(
         self,
@@ -38,7 +44,11 @@ class Verifier:
         prompt: str,
     ) -> tuple[bool, float, str]:
         """Ask model provider to act as an objective judge on candidate response."""
-        if self.provider is None:
+        active_provider = self.provider
+        if self.router is not None:
+            active_provider = self.router.get_provider(ModelRole.JUDGE)
+
+        if active_provider is None:
             return True, 1.0, "Model provider unavailable; skipped judge check"
 
         rubric = criteria.custom_judge_rubric or (
@@ -70,7 +80,7 @@ class Verifier:
         )
 
         try:
-            resp = await self.provider.complete(req)
+            resp = await active_provider.complete(req)
             raw = resp.text.strip()
             if "```" in raw:
                 match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
@@ -211,6 +221,10 @@ class Verifier:
                 span.set_attribute("yusufclaw.verifier.score", res.score)
                 span.set_attribute("yusufclaw.verifier.retry_recommended", res.retry_recommended)
                 span.set_attribute("yusufclaw.verifier.retries_attempted", res.retries_attempted)
+                if criteria.model_judge_required and self.router is not None:
+                    _, p_name, _ = self.router.route(ModelRole.JUDGE)
+                    span.set_attribute("yusufclaw.routing.role", ModelRole.JUDGE.value)
+                    span.set_attribute("yusufclaw.routing.provider", p_name)
 
             return res
 

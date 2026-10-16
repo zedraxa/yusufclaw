@@ -19,6 +19,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import (
     Message,
     ModelProvider,
@@ -62,11 +63,13 @@ class PlanAndExecuteWorkflow:
         budget_manager: BudgetManager,
         verifier: Verifier | None = None,
         available_tools: Sequence[ToolDefinition] | None = None,
+        router: ModelRouter | None = None,
     ) -> None:
         self.provider = provider
+        self.router = router
         self.subagent_runner = subagent_runner
         self.budget_manager = budget_manager
-        self.verifier = verifier or Verifier(provider=provider)
+        self.verifier = verifier or Verifier(provider=provider, router=router)
         self.available_tools = list(available_tools) if available_tools else []
         self.available_tool_names = [t.name for t in self.available_tools]
         self.graph = self._build_graph()
@@ -113,8 +116,12 @@ class PlanAndExecuteWorkflow:
             temperature=0.0,
         )
 
+        planner_provider = self.provider
+        if self.router is not None:
+            planner_provider = self.router.get_provider(ModelRole.PLANNER)
+
         try:
-            resp = await self.provider.complete(req)
+            resp = await planner_provider.complete(req)
             self.budget_manager.record_tokens(
                 resp.usage.get("prompt_tokens", 10),
                 resp.usage.get("completion_tokens", 10),
@@ -158,6 +165,10 @@ class PlanAndExecuteWorkflow:
 
                 if span.is_recording():
                     span.set_attribute("yusufclaw.plan.steps_count", len(plan.steps))
+                    if self.router is not None:
+                        _, p_name, _ = self.router.route(ModelRole.PLANNER)
+                        span.set_attribute("yusufclaw.routing.role", ModelRole.PLANNER.value)
+                        span.set_attribute("yusufclaw.routing.provider", p_name)
 
                 return {
                     "plan": plan,
@@ -210,13 +221,17 @@ class PlanAndExecuteWorkflow:
                         step_output = f"Subagent error: {sub_res.error}"
                 else:
                     # Direct step execution via model
+                    step_provider = self.provider
+                    if self.router is not None:
+                        step_provider = self.router.get_provider(ModelRole.DEFAULT)
+
                     req = ModelRequest(
                         system="You are executing a discrete step of an overall task plan. Provide factual, concise output.",
                         messages=[
                             Message(role="user", content=f"Goal: {plan.goal}\nCurrent Step: {step.description}")
                         ],
                     )
-                    resp = await self.provider.complete(req)
+                    resp = await step_provider.complete(req)
                     self.budget_manager.record_tokens(
                         resp.usage.get("prompt_tokens", 10),
                         resp.usage.get("completion_tokens", 10),
@@ -232,7 +247,11 @@ class PlanAndExecuteWorkflow:
                 )
 
                 if not v_res.passed and v_res.retry_recommended and v_res.retry_prompt:
-                    # Execute 1 retry
+                    # Execute 1 retry with strong/planner model
+                    retry_provider = self.provider
+                    if self.router is not None:
+                        retry_provider = self.router.get_provider(ModelRole.STRONG)
+
                     req_retry = ModelRequest(
                         system="Revise the step execution based on feedback.",
                         messages=[
@@ -241,7 +260,7 @@ class PlanAndExecuteWorkflow:
                             Message(role="user", content=v_res.retry_prompt),
                         ],
                     )
-                    resp_retry = await self.provider.complete(req_retry)
+                    resp_retry = await retry_provider.complete(req_retry)
                     self.budget_manager.record_tokens(
                         resp_retry.usage.get("prompt_tokens", 10),
                         resp_retry.usage.get("completion_tokens", 10),
@@ -276,6 +295,10 @@ class PlanAndExecuteWorkflow:
                 results = state.get("step_results", {})
                 budget_exceeded = state.get("budget_exceeded", False)
 
+                synth_provider = self.provider
+                if self.router is not None:
+                    synth_provider = self.router.get_provider(ModelRole.SYNTHESIS)
+
                 summary_bullets = "\n".join(
                     f"- Step {sid}: {res}" for sid, res in sorted(results.items())
                 )
@@ -296,7 +319,7 @@ class PlanAndExecuteWorkflow:
                         )
                     ],
                 )
-                resp = await self.provider.complete(req)
+                resp = await synth_provider.complete(req)
                 self.budget_manager.record_tokens(
                     resp.usage.get("prompt_tokens", 10),
                     resp.usage.get("completion_tokens", 10),
@@ -313,6 +336,10 @@ class PlanAndExecuteWorkflow:
                 if span.is_recording():
                     span.set_attribute("yusufclaw.synthesis.steps_used", len(results))
                     span.set_attribute("yusufclaw.synthesis.budget_exceeded", budget_exceeded)
+                    if self.router is not None:
+                        _, p_name, _ = self.router.route(ModelRole.SYNTHESIS)
+                        span.set_attribute("yusufclaw.routing.role", ModelRole.SYNTHESIS.value)
+                        span.set_attribute("yusufclaw.routing.provider", p_name)
 
                 return {"final_response": final_text}
 

@@ -13,9 +13,11 @@ Implements the YusufClaw adaptive orchestration lifecycle:
 
 from __future__ import annotations
 
+import inspect
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
+from yusufclaw.models.router import ModelRole, ModelRouter
 from yusufclaw.models.types import Message, ModelProvider, ModelRequest, ToolDefinition
 from yusufclaw.orchestration.budget import BudgetManager
 from yusufclaw.orchestration.models import (
@@ -32,7 +34,7 @@ from yusufclaw.telemetry import get_tracer
 
 logger = logging.getLogger(__name__)
 
-DirectTurnFn = Callable[[], Awaitable[str]]
+DirectTurnFn = Callable[[], Awaitable[str]] | Callable[[ModelProvider | None], Awaitable[str]]
 DirectRetryFn = Callable[[str], Awaitable[str]]
 
 
@@ -41,39 +43,72 @@ class AdaptiveOrchestrator:
 
     def __init__(
         self,
-        provider: ModelProvider,
+        provider: ModelProvider | None = None,
         config: OrchestrationConfig | None = None,
         tools: Sequence[ToolDefinition] | None = None,
         grants: Grants | None = None,
+        router: ModelRouter | None = None,
+        providers: Mapping[str, ModelProvider] | None = None,
     ) -> None:
-        self.provider = provider
         self.config = config or OrchestrationConfig(enabled=True)
         self.tools = list(tools) if tools else []
         self.grants = grants
 
-        # Initialize subcomponents
+        # Setup model router
+        if router is not None:
+            self.router = router
+            self.provider = provider or router.get_provider(ModelRole.DEFAULT)
+        elif providers is not None:
+            self.router = ModelRouter(
+                providers=providers,
+                default_provider=provider,
+                config=self.config.routing,
+            )
+            self.provider = provider or self.router.get_provider(ModelRole.DEFAULT)
+        elif provider is not None:
+            self.provider = provider
+            self.router = ModelRouter(
+                default_provider=provider,
+                config=self.config.routing,
+            )
+        else:
+            from yusufclaw.models import get_model_provider
+
+            self.provider = get_model_provider()
+            self.router = ModelRouter(
+                default_provider=self.provider,
+                config=self.config.routing,
+            )
+
+        # Initialize subcomponents with routed providers
         self.task_analyzer = TaskAnalyzer(
-            provider=provider,
+            provider=self.router.get_provider(ModelRole.CLASSIFY),
             available_tools=self.tools,
+            router=self.router,
         )
         self.budget_manager = BudgetManager(
             limits=self.config.budget_limits,
             pricing=self.config.token_pricing,
         )
-        self.verifier = Verifier(provider=provider)
+        self.verifier = Verifier(
+            provider=self.router.get_provider(ModelRole.JUDGE),
+            router=self.router,
+        )
         self.subagent_runner = SubagentRunner(
-            provider=provider,
+            provider=self.provider,
             parent_tools=self.tools,
             parent_grants=self.grants,
             budget_manager=self.budget_manager,
             use_deep_agents=self.config.use_deep_agents_if_available,
+            router=self.router,
         )
         self.planner = PlanAndExecuteWorkflow(
-            provider=provider,
+            provider=self.router.get_provider(ModelRole.PLANNER),
             subagent_runner=self.subagent_runner,
             budget_manager=self.budget_manager,
             verifier=self.verifier,
             available_tools=self.tools,
+            router=self.router,
         )
 
     async def orchestrate_turn(
@@ -112,7 +147,19 @@ class AdaptiveOrchestrator:
                 candidate_output = await self.planner.execute(prompt, initial_plan=initial_plan)
             else:
                 # Direct agent execution loop
-                candidate_output = await direct_turn_fn()
+                # Prefer cheap provider for simple and low-risk tasks when configured
+                routed_direct_provider: ModelProvider | None = None
+                if self.router is not None:
+                    routed_direct_provider = self.router.get_provider(
+                        role=ModelRole.DEFAULT,
+                        analysis=analysis,
+                    )
+
+                sig = inspect.signature(direct_turn_fn)
+                if len(sig.parameters) > 0:
+                    candidate_output = await direct_turn_fn(routed_direct_provider)  # type: ignore[call-arg]
+                else:
+                    candidate_output = await direct_turn_fn()  # type: ignore[call-arg]
 
             # 4. Check budget after execution
             budget_status = self.budget_manager.check_limits()
@@ -146,7 +193,12 @@ class AdaptiveOrchestrator:
                 if direct_retry_fn is not None and analysis.strategy == "direct":
                     retry_output = await direct_retry_fn(v_result.retry_prompt)
                 else:
-                    # Generic model revision
+                    # Strong model revision
+                    retry_provider = (
+                        self.router.get_provider(ModelRole.STRONG)
+                        if self.router is not None
+                        else self.provider
+                    )
                     req = ModelRequest(
                         system="Revise and fix the response to satisfy all verification requirements.",
                         messages=[
@@ -155,7 +207,7 @@ class AdaptiveOrchestrator:
                             Message(role="user", content=v_result.retry_prompt),
                         ],
                     )
-                    resp = await self.provider.complete(req)
+                    resp = await retry_provider.complete(req)
                     self.budget_manager.record_tokens(
                         resp.usage.get("prompt_tokens", 10),
                         resp.usage.get("completion_tokens", 10),
@@ -178,6 +230,10 @@ class AdaptiveOrchestrator:
             if span.is_recording():
                 span.set_attribute("yusufclaw.orchestration.strategy_used", analysis.strategy)
                 span.set_attribute("yusufclaw.orchestration.verified", v_result.passed)
+                if self.router is not None:
+                    _, p_name, _ = self.router.route(role=ModelRole.DEFAULT, analysis=analysis)
+                    span.set_attribute("yusufclaw.routing.provider", p_name)
+                    span.set_attribute("yusufclaw.routing.role", ModelRole.DEFAULT.value)
 
             return candidate_output, analysis
 

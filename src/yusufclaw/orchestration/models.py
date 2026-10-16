@@ -16,6 +16,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from yusufclaw.models.router import RoutingConfig
+
 ComplexityLevel = Literal["simple", "medium", "complex"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
 OrchestrationStrategy = Literal["direct", "plan_and_execute", "delegate"]
@@ -187,6 +189,7 @@ class OrchestrationConfig(BaseModel):
     budget_limits: BudgetLimits = Field(default_factory=BudgetLimits)
     token_pricing: TokenPricing = Field(default_factory=TokenPricing)
     use_deep_agents_if_available: bool = True
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
 
 RuleCheckFn = Callable[[str], tuple[bool, str]]
