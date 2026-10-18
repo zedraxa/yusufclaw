@@ -13,12 +13,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+AG_UI_PROTOCOL_VERSION = "ag-ui/1.0"
+
 
 class AgUiEnvelope(BaseModel):
     """Canonical AG-UI 1.0 event envelope schema (docs/UX-SPEC.md §3.1)."""
 
     model_config = ConfigDict(populate_by_name=True)
 
+    protocol_version: str = Field(
+        default=AG_UI_PROTOCOL_VERSION, alias="protocolVersion"
+    )
     event_id: str = Field(alias="eventId")
     run_id: str = Field(alias="runId")
     session_id: str = Field(alias="sessionId")
@@ -43,6 +48,7 @@ class AgUiEnvelope(BaseModel):
     ) -> AgUiEnvelope:
         """Create a strongly typed AG-UI envelope."""
         return cls(
+            protocolVersion=AG_UI_PROTOCOL_VERSION,
             eventId=event_id or f"evt_{uuid.uuid4().hex[:18]}",
             runId=run_id,
             sessionId=session_id,
@@ -246,6 +252,7 @@ class MemoryReviseApiInput(BaseModel):
 
 
 __all__ = [
+    "AG_UI_PROTOCOL_VERSION",
     "AgUiEnvelope",
     "AgentPersona",
     "MemoryForgetInput",

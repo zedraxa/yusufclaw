@@ -1027,3 +1027,18 @@ cd infra_py && cdk destroy --all --force --profile yusufclaw
 - **Doğrulama**: `uv run pytest -q` → **360 passed, 1 skipped, 1 xfailed**; `uv run ruff check .` temiz; `uv run mypy src` → **111 kaynak dosyasında 0 hata**. Testler: `tests/python/test_ux_sprint2_memory.py`. Kılavuz: `docs/PY-UX-S2.md`.
 - §§1–28 korunmuştur.
 
+
+---
+
+## 30. Python Web Gateway Sprint 3 Workspace Readiness Pack (UX-08/11/12/13) — `cursor/ux-07-memory-canvas-9394` Dalı
+
+- **Amaç**: Bitirici paket — workspace'i kullanıma hazır hale getirmek; protokol sürümlerini sabitlemek (`ag-ui/1.0`, `a2a/1.0`, `mcp/2025-03-26`).
+- **UX-08**: `GET/POST/DELETE /api/automation/routines` — cron doğrulama, grants, misfire, `nextDueAt`; Routines sekmesi.
+- **UX-11**: `GET /api/connectors` + pin/quarantine; MCP OAuth alanları (`oauthClientId`, `oauthRedirectUri`); Connectors sekmesi.
+- **UX-12**: `GET /api/teammates` + turn sonunda `teammate.*` SSE; Teammates sekmesi; `AgentCard.protocolVersion`.
+- **UX-13**: `UsageMeter` ($50 tavan, aylık state), `GET /api/usage`, header gauge, `meter.usage` SSE; chat JSON `usage`.
+- **Modül**: `src/yusufclaw/gateway/workspace.py`. Kılavuz: `docs/PY-UX-S3.md`.
+- **Doğrulama**: `uv run pytest -q` → **366 passed, 1 skipped, 1 xfailed**; ruff temiz; mypy **112 dosya / 0 hata**.
+- **Not**: GitHub Actions faturalama kilidi nedeniyle CI runner başlamıyor (kod/test hatası değil). UX-09/10 (artifacts/screencast) sonraki adım.
+- §§1–29 korunmuştur.
+

@@ -124,6 +124,12 @@ class AgentCard(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+    protocol_version: str = Field(
+        default="a2a/1.0",
+        validation_alias=AliasChoices("protocol_version", "protocolVersion"),
+        serialization_alias="protocolVersion",
+        description="Agent-to-Agent protocol version advertised by this card",
+    )
     id: str = Field(
         ...,
         validation_alias=AliasChoices("id", "agent_id", "agentId"),

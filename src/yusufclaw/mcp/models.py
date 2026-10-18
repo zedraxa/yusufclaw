@@ -13,10 +13,12 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 TransportType = Literal["stdio", "streamable_http", "sse"]
 QuarantineStatus = Literal["active", "quarantined", "unverified"]
+# Spec revision commonly used by current MCP Python SDK streamable HTTP clients.
+MCP_PROTOCOL_VERSION = "mcp/2025-03-26"
 
 
 class MCPServerConfig(BaseModel):
@@ -25,8 +27,26 @@ class MCPServerConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     name: str = Field(..., description="Unique identifier for the server")
+    protocol_version: str = Field(
+        default=MCP_PROTOCOL_VERSION,
+        validation_alias=AliasChoices("protocol_version", "protocolVersion"),
+        serialization_alias="protocolVersion",
+        description="MCP protocol revision spoken by this connector",
+    )
     transport: TransportType = Field(
         default="stdio", description="Transport mechanism: stdio, streamable_http, or sse"
+    )
+    oauth_client_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("oauth_client_id", "oauthClientId"),
+        serialization_alias="oauthClientId",
+        description="Optional OAuth client_id for remote MCP authorization",
+    )
+    oauth_redirect_uri: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("oauth_redirect_uri", "oauthRedirectUri"),
+        serialization_alias="oauthRedirectUri",
+        description="Registered OAuth redirect URI (must match provider allow-list)",
     )
     command: str | None = Field(
         default=None, description="Executable command for stdio transport"

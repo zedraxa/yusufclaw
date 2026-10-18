@@ -36,6 +36,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from pydantic import BaseModel, ConfigDict, Field
 
 from yusufclaw import __version__
+from yusufclaw.a2a.hook import TeammateStatusHook
+from yusufclaw.a2a.registry import TeammateRegistry
 from yusufclaw.agent import reset_turn_event_hook, set_turn_event_hook
 from yusufclaw.config import Settings, get_settings
 from yusufclaw.gateway.approval import (
@@ -50,6 +52,7 @@ from yusufclaw.gateway.credentials import (
     get_credential_broker,
 )
 from yusufclaw.gateway.models import (
+    AG_UI_PROTOCOL_VERSION,
     AgentPersona,
     AgUiEnvelope,
     MemoryForgetInput,
@@ -62,8 +65,18 @@ from yusufclaw.gateway.models import (
     WidgetResolveInput,
 )
 from yusufclaw.gateway.web_page import CHAT_PAGE, CHAT_SCRIPT, CHAT_STYLE
+from yusufclaw.gateway.workspace import (
+    AutomationStore,
+    UsageMeter,
+    serialize_connectors,
+    serialize_teammates,
+    validate_routine_payload,
+)
+from yusufclaw.mcp.models import MCPConfig
+from yusufclaw.mcp.pinning import PinningStore
 from yusufclaw.memory.models import ListOptions, MemoryKind, ReviseInput
 from yusufclaw.memory.store import resolve as resolve_memory
+from yusufclaw.routines.models import Routine
 from yusufclaw.telemetry import setup_telemetry
 
 SENSITIVE_KEY_SUBSTRINGS = {
@@ -262,6 +275,7 @@ def format_agui_event(
     merged = dict(payload)
     merged.update(
         {
+            "protocolVersion": AG_UI_PROTOCOL_VERSION,
             "eventId": evt_id,
             "runId": run_id,
             "sessionId": session_id,
@@ -283,6 +297,12 @@ def create_app(
     settings: Settings | None = None,
     approval_provider: ApprovalProvider | None = None,
     credential_broker: CredentialBroker | None = None,
+    mcp_config: MCPConfig | None = None,
+    pinning_store: PinningStore | None = None,
+    teammate_registry: TeammateRegistry | None = None,
+    teammate_hook: TeammateStatusHook | None = None,
+    routines: list[Routine] | None = None,
+    usage_meter: UsageMeter | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI web gateway application."""
     actual_bus: MessageBus | None
@@ -312,6 +332,12 @@ def create_app(
     active_credential_broker: CredentialBroker = (
         credential_broker if credential_broker is not None else get_credential_broker()
     )
+    active_mcp_config = mcp_config or MCPConfig()
+    active_pinning = pinning_store or PinningStore()
+    active_teammate_registry = teammate_registry
+    active_teammate_hook = teammate_hook or TeammateStatusHook()
+    active_usage = usage_meter or UsageMeter(memory=memory)
+    automation_store = AutomationStore(memory=memory, seed=list(routines or []))
     pending_approvals: dict[str, dict[str, Any]] = {}
     pending_questions: dict[str, dict[str, Any]] = {}
     resolved_questions: dict[str, dict[str, Any]] = {}
@@ -323,6 +349,7 @@ def create_app(
             service_name=cfg.otel_service_name,
             otlp_endpoint=cfg.otel_exporter_otlp_endpoint,
         )
+        await active_usage.load_monthly()
         yield
 
     app = FastAPI(
@@ -949,6 +976,159 @@ def create_app(
             },
         )
 
+    @app.get("/api/automation/routines")
+    async def list_automation_routines(request: Request) -> JSONResponse:
+        """List validated routine definitions with next-due timestamps (UX-08)."""
+        _verify_auth(request)
+        defs = await automation_store.list_definitions()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "protocolVersion": AG_UI_PROTOCOL_VERSION,
+                "routines": defs,
+                "eventType": "routine.catalog",
+            },
+        )
+
+    @app.post("/api/automation/routines")
+    async def create_automation_routine(request: Request) -> JSONResponse:
+        """Create a routine with strict grants and verified next-due (UX-08)."""
+        _verify_auth(request)
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        try:
+            raw = json.loads((await request.body()).decode("utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("object required")
+            payload = validate_routine_payload(raw)
+            created = await automation_store.create(**payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid routine payload"}
+            ) from exc
+        return JSONResponse(status_code=201, content=created)
+
+    @app.delete("/api/automation/routines/{routine_id}")
+    async def delete_automation_routine(
+        request: Request, routine_id: str
+    ) -> JSONResponse:
+        """Delete a user-authored routine definition (UX-08)."""
+        _verify_auth(request)
+        removed = await automation_store.delete(routine_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail={"error": "Routine not found"})
+        return JSONResponse(
+            status_code=200,
+            content={"id": routine_id, "deleted": True, "eventType": "routine.deleted"},
+        )
+
+    @app.get("/api/connectors")
+    async def list_connectors(request: Request) -> JSONResponse:
+        """MCP connector hub status with pin/quarantine metadata (UX-11)."""
+        _verify_auth(request)
+        rows = serialize_connectors(active_mcp_config, active_pinning)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "protocolVersion": "mcp/2025-03-26",
+                "connectors": rows,
+                "eventType": "connector.catalog",
+            },
+        )
+
+    @app.post("/api/connectors/{connector_id}/pin")
+    async def pin_connector(request: Request, connector_id: str) -> JSONResponse:
+        """Approve current tool hash and clear quarantine (UX-11)."""
+        _verify_auth(request)
+        name = connector_id.strip()
+        server = active_mcp_config.servers.get(name)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "Unknown connector"})
+        body: dict[str, Any] = {}
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                raw = json.loads((await request.body()).decode("utf-8") or "{}")
+                if isinstance(raw, dict):
+                    body = raw
+            except Exception:
+                body = {}
+        tools_hash = str(
+            body.get("toolsHash") or body.get("pinnedHash") or server.pinned_hash or ""
+        ).strip()
+        if not tools_hash:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "toolsHash required to pin connector"},
+            )
+        rec = active_pinning.pin_server(
+            name, tools_hash=tools_hash, version=server.version
+        )
+        server.quarantined = False
+        server.pinned_hash = tools_hash
+        return JSONResponse(
+            status_code=200,
+            content={
+                "connectorId": name,
+                "status": "connected",
+                "pinnedHash": rec.tools_hash,
+                "protocolVersion": server.protocol_version,
+                "eventType": "connector.status_changed",
+            },
+        )
+
+    @app.post("/api/connectors/{connector_id}/quarantine")
+    async def quarantine_connector(request: Request, connector_id: str) -> JSONResponse:
+        """Force-quarantine a connector until re-pin (UX-11)."""
+        _verify_auth(request)
+        name = connector_id.strip()
+        server = active_mcp_config.servers.get(name)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "Unknown connector"})
+        reason = "Operator quarantine"
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                raw = json.loads((await request.body()).decode("utf-8") or "{}")
+                if isinstance(raw, dict) and raw.get("reason"):
+                    reason = str(raw["reason"])[:512]
+            except Exception:
+                pass
+        rec = active_pinning.quarantine_server(
+            name,
+            reason=reason,
+            tools_hash=server.pinned_hash or "",
+            version=server.version,
+        )
+        server.quarantined = True
+        return JSONResponse(
+            status_code=200,
+            content={
+                "connectorId": name,
+                "status": "quarantined",
+                "quarantineReason": rec.quarantine_reason,
+                "pinnedHash": rec.tools_hash,
+                "eventType": "connector.status_changed",
+            },
+        )
+
+    @app.get("/api/teammates")
+    async def list_teammates(request: Request) -> JSONResponse:
+        """A2A teammate hierarchy visualizer snapshot (UX-12)."""
+        _verify_auth(request)
+        return JSONResponse(
+            status_code=200,
+            content=serialize_teammates(active_teammate_registry, active_teammate_hook),
+        )
+
+    @app.get("/api/usage")
+    async def get_usage_meter(request: Request) -> JSONResponse:
+        """Token/cost meter against the $50 monthly ceiling (UX-13)."""
+        _verify_auth(request)
+        await active_usage.load_monthly()
+        return JSONResponse(status_code=200, content=active_usage.snapshot())
+
     @app.post("/api/chat")
     async def chat(
         request: Request, accept: str | None = Header(default=None)
@@ -974,12 +1154,15 @@ def create_app(
                     pending_questions=pending_questions,
                     pending_secrets=pending_secrets,
                     credential_broker=active_credential_broker,
+                    usage_meter=active_usage,
+                    teammate_hook=active_teammate_hook,
                 ),
                 media_type="text/event-stream",
             )
 
         # Standard synchronous turn
         try:
+            active_usage.begin_turn()
             reply = await actual_bus.dispatch(
                 IncomingMessage(
                     channel="web",
@@ -990,7 +1173,13 @@ def create_app(
                     agentId=msg_in.agentId,
                 )
             )
-            return JSONResponse(status_code=200, content={"reply": reply})
+            approx_prompt = max(1, len(msg_in.text) // 4)
+            approx_completion = max(1, len(reply or "") // 4)
+            await active_usage.record_tokens(approx_prompt, approx_completion)
+            return JSONResponse(
+                status_code=200,
+                content={"reply": reply, "usage": active_usage.snapshot()},
+            )
         except Exception:
             # Mask internal exceptions and URLs
             return JSONResponse(
@@ -1023,6 +1212,8 @@ def create_app(
                 pending_questions=pending_questions,
                 pending_secrets=pending_secrets,
                 credential_broker=active_credential_broker,
+                usage_meter=active_usage,
+                teammate_hook=active_teammate_hook,
             ),
             media_type="text/event-stream",
         )
@@ -1068,6 +1259,8 @@ async def _stream_chat_events(
     pending_questions: dict[str, dict[str, Any]] | None = None,
     pending_secrets: dict[str, asyncio.Future[dict[str, Any]]] | None = None,
     credential_broker: CredentialBroker | None = None,
+    usage_meter: UsageMeter | None = None,
+    teammate_hook: TeammateStatusHook | None = None,
 ) -> AsyncIterator[str]:
     """Emit AG-UI 1.0 Server-Sent Events (run.acknowledged, run.milestone, message.delta, widgets, run.completed)."""
     run_id = f"run-{uuid.uuid4()}"
@@ -1081,6 +1274,11 @@ async def _stream_chat_events(
     start_time = datetime.now(UTC)
     accumulated_text = ""
     current_step = 1
+    meter = usage_meter or UsageMeter()
+    meter.begin_turn()
+    hook_seen = 0
+    if teammate_hook is not None:
+        hook_seen = len(teammate_hook.history)
 
     def agui_ev(event_type: str, payload: dict[str, Any]) -> str:
         nonlocal sequence
@@ -1512,6 +1710,20 @@ async def _stream_chat_events(
                     },
                 )
             )
+            # UX-12: flush teammate hierarchy events observed during the turn
+            if teammate_hook is not None:
+                for ev in teammate_hook.history[hook_seen:]:
+                    await event_queue.put(
+                        agui_ev(
+                            ev.event_type,
+                            ev.model_dump(by_alias=True, mode="json"),
+                        )
+                    )
+            # UX-13: usage meter against $50 monthly ceiling
+            approx_prompt = max(1, len(msg_in.text) // 4)
+            approx_completion = max(1, len(reply or accumulated_text) // 4)
+            await meter.record_tokens(approx_prompt, approx_completion)
+            await event_queue.put(agui_ev("meter.usage", meter.snapshot()))
             # Legacy done event for backward compatibility
             await event_queue.put(
                 format_sse_event(

@@ -166,10 +166,13 @@ async def test_web_chat_success_and_error_sanitization(
     }
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1:3000") as client:
-        # Success response
+        # Success response (includes UX-13 usage meter snapshot)
         res = await client.post("/api/chat", json=valid_message, headers=headers)
         assert res.status_code == 200
-        assert res.json() == {"reply": "<script>hello</script>"}
+        body = res.json()
+        assert body["reply"] == "<script>hello</script>"
+        assert "usage" in body
+        assert body["usage"]["monthlyLimitUsd"] == 50.0
         assert agent.call_count == 1
 
         # Internal error throwing critical secret -> 502 with secret hidden
