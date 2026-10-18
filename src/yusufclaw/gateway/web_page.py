@@ -6,6 +6,8 @@ Provides:
 - Inline question & option decision widgets (UX-04).
 - Verifiable action cards with 5-minute countdown and draft edit (UX-05).
 - Masked secret-request modal with local credential broker integration (UX-06).
+- Transparent memory inspection & deterministic forget canvas (UX-07).
+- Routines dashboard, MCP connector hub, A2A teammates tree, $50 usage meter (UX-08/11/12/13).
 Strictly adheres to CSP: zero innerHTML, zero localStorage/sessionStorage, all textContent.
 """
 
@@ -35,10 +37,25 @@ CHAT_PAGE = """<!doctype html>
       <div class="header-titles">
         <h1>YusufClaw</h1>
         <span id="current-agent" class="agent-active-badge">Active: YusufClaw (orchestrator)</span>
+        <div id="usage-meter" class="usage-meter" title="Monthly budget meter" role="meter" aria-valuemin="0" aria-valuemax="50">
+          <div class="usage-meter-text">
+            <span id="usage-turn">Turn: —</span>
+            <span id="usage-month">$0.00 / $50.00</span>
+          </div>
+          <div class="usage-bar"><div id="usage-bar-fill" class="usage-bar-fill level-green"></div></div>
+        </div>
       </div>
-      <p class="header-subtitle">Private Autonomous Assistant · AG-UI 1.0 Streaming</p>
+      <p class="header-subtitle">Private Autonomous Assistant · AG-UI 1.0 · A2A 1.0 · MCP 2025-03-26</p>
+      <div class="view-tabs" role="tablist" aria-label="Workspace views">
+        <button type="button" id="tab-chat" class="view-tab active" role="tab" aria-selected="true">Chat</button>
+        <button type="button" id="tab-memory" class="view-tab" role="tab" aria-selected="false">Memory</button>
+        <button type="button" id="tab-routines" class="view-tab" role="tab" aria-selected="false">Routines</button>
+        <button type="button" id="tab-connectors" class="view-tab" role="tab" aria-selected="false">Connectors</button>
+        <button type="button" id="tab-teammates" class="view-tab" role="tab" aria-selected="false">Teammates</button>
+      </div>
     </header>
 
+    <div id="chat-view">
     <div id="ack-banner" class="ack-banner" style="display:none;" role="status"></div>
     <div id="milestones" class="milestone-stepper" aria-live="polite"></div>
 
@@ -69,7 +86,100 @@ CHAT_PAGE = """<!doctype html>
       <h2>Scheduled replies &amp; Outbox</h2>
       <div id="routines" class="routines-container"></div>
     </section>
+    </div>
+
+    <section id="memory-view" class="memory-view" style="display:none;" aria-label="Memory inspection canvas">
+      <div class="memory-toolbar">
+        <div>
+          <h2>Memory canvas</h2>
+          <p id="memory-scope-label" class="memory-scope">Scope: —</p>
+        </div>
+        <button type="button" id="memory-refresh" class="btn-edit">Refresh</button>
+      </div>
+      <p id="memory-status" class="memory-status" role="status"></p>
+      <div class="memory-split">
+        <div class="memory-pane">
+          <h3>Profile &amp; durable facts</h3>
+          <p class="pane-hint">Active claims with evidence IDs, trust, and validity.</p>
+          <div id="memory-profile" class="memory-list" aria-live="polite"></div>
+        </div>
+        <div class="memory-pane">
+          <h3>Episodic journal</h3>
+          <p class="pane-hint">Notes and milestones from this session scope.</p>
+          <div id="memory-journal" class="memory-list" aria-live="polite"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="routines-view" class="ops-view" style="display:none;" aria-label="Routines dashboard">
+      <div class="memory-toolbar">
+        <div>
+          <h2>Routines &amp; automation</h2>
+          <p class="pane-hint">Cron schedules with capability grants and next-due verification.</p>
+        </div>
+        <button type="button" id="routines-refresh" class="btn-edit">Refresh</button>
+      </div>
+      <form id="routine-create" class="routine-form">
+        <div class="form-row">
+          <label>ID <input id="routine-id" maxlength="64" required placeholder="morning-brief"></label>
+          <label>Cron (UTC) <input id="routine-cron" required placeholder="0 8 * * *"></label>
+        </div>
+        <label>Prompt <textarea id="routine-prompt" maxlength="16000" required placeholder="Prepare a morning briefing..."></textarea></label>
+        <div class="form-row">
+          <label>Grants <input id="routine-grants" placeholder="web_fetch, memory_search"></label>
+          <label>Misfire
+            <select id="routine-misfire">
+              <option value="skip">Skip</option>
+              <option value="coalesce">Coalesce</option>
+              <option value="catchup">Catchup</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit" class="btn-approve">Create routine</button>
+      </form>
+      <p id="routines-status" class="memory-status" role="status"></p>
+      <div id="routines-list" class="ops-list"></div>
+    </section>
+
+    <section id="connectors-view" class="ops-view" style="display:none;" aria-label="MCP connector hub">
+      <div class="memory-toolbar">
+        <div>
+          <h2>MCP connector hub</h2>
+          <p class="pane-hint">Pinned tool hashes, quarantine diffs, OAuth-ready remotes.</p>
+        </div>
+        <button type="button" id="connectors-refresh" class="btn-edit">Refresh</button>
+      </div>
+      <p id="connectors-status" class="memory-status" role="status"></p>
+      <div id="connectors-list" class="ops-list"></div>
+    </section>
+
+    <section id="teammates-view" class="ops-view" style="display:none;" aria-label="A2A teammates visualizer">
+      <div class="memory-toolbar">
+        <div>
+          <h2>A2A teammates</h2>
+          <p class="pane-hint">Depth-1 hierarchy, budgets, segregated data-channel events.</p>
+        </div>
+        <button type="button" id="teammates-refresh" class="btn-edit">Refresh</button>
+      </div>
+      <p id="teammates-status" class="memory-status" role="status"></p>
+      <div id="teammates-tree" class="ops-list"></div>
+    </section>
   </main>
+</div>
+
+<div id="forget-modal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="forget-title">
+  <div class="modal-card">
+    <h3 id="forget-title">Forget memory</h3>
+    <p class="modal-notice">This permanently removes the fact from active retrieval, FTS indices, and future context assemblies. A tombstone remains for audit.</p>
+    <div class="modal-meta">
+      <div><strong>Evidence:</strong> <span id="forget-record-id"></span></div>
+      <div><strong>Text:</strong> <span id="forget-record-text"></span></div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" id="forget-confirm" class="btn-deny">Forget</button>
+      <button type="button" id="forget-cancel" class="btn-edit">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <div id="secret-modal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -170,12 +280,62 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#fff;padding:1rem;bor
 .masked-input-wrapper{display:flex;gap:.5rem;align-items:center}
 .btn-toggle-vis{background:#eee;color:#333;padding:.6rem .8rem}
 .modal-actions{display:flex;justify-content:flex-end;gap:.8rem;margin-top:1.2rem}
-.routines-section{margin-top:2rem;border-top:1px solid #ddd;padding-top:1rem}"""
+.routines-section{margin-top:2rem;border-top:1px solid #ddd;padding-top:1rem}
+.view-tabs{display:flex;gap:.5rem;margin-top:1rem}
+.view-tab{background:#e7e5e4;color:#202020;padding:.45rem 1rem;border-radius:6px;font-size:.85rem}
+.view-tab.active{background:#202020;color:#fff}
+.memory-view{margin-top:.5rem}
+.memory-toolbar{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:.8rem}
+.memory-toolbar h2{margin:0 0 .3rem 0;font-size:1.25rem}
+.memory-scope{margin:0;color:#666;font-size:.85rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.memory-status{min-height:1.2rem;font-size:.85rem;color:#137333;margin:.2rem 0 .8rem}
+.memory-split{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:900px){.memory-split{grid-template-columns:1fr}}
+.memory-pane{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;min-height:280px}
+.memory-pane h3{margin:0 0 .3rem 0;font-size:1rem}
+.pane-hint{margin:0 0 .8rem 0;color:#666;font-size:.8rem}
+.memory-list{display:flex;flex-direction:column;gap:.7rem}
+.memory-row{border:1px solid #e7e5e4;border-radius:6px;padding:.75rem;background:#fafaf9;transition:opacity .35s ease,transform .35s ease}
+.memory-row.vaporize{opacity:0;transform:translateY(-6px)}
+.memory-row-text{font-size:.9rem;margin-bottom:.45rem;white-space:pre-wrap}
+.memory-meta{display:flex;flex-wrap:wrap;gap:.4rem;margin-bottom:.55rem}
+.evidence-pill{display:inline-block;font-size:.72rem;padding:.15rem .45rem;border-radius:4px;background:#e0e7ff;color:#3730a3;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.trust-pill{display:inline-block;font-size:.72rem;padding:.15rem .45rem;border-radius:4px;font-weight:600}
+.trust-user_explicit{background:#dcfce7;color:#166534}
+.trust-observed{background:#dbeafe;color:#1e40af}
+.trust-model_inferred{background:#ffedd5;color:#9a3412}
+.trust-external{background:#f3e8ff;color:#6b21a8}
+.validity-range{font-size:.75rem;color:#555}
+.memory-actions{display:flex;gap:.5rem}
+.memory-actions button{padding:.35rem .7rem;font-size:.8rem}
+.memory-edit-box{display:none;margin-top:.5rem}
+.memory-edit-box textarea{min-height:60px;font-size:.85rem}
+.memory-empty{color:#888;font-size:.85rem;padding:.5rem 0}
+.usage-meter{margin-left:auto;min-width:180px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:.45rem .7rem}
+.usage-meter-text{display:flex;justify-content:space-between;gap:.6rem;font-size:.72rem;color:#444;margin-bottom:.25rem}
+.usage-bar{height:6px;background:#e7e5e4;border-radius:999px;overflow:hidden}
+.usage-bar-fill{height:100%;width:0%;transition:width .35s ease,background .35s ease}
+.usage-bar-fill.level-green{background:#16a34a}
+.usage-bar-fill.level-yellow{background:#ca8a04}
+.usage-bar-fill.level-red{background:#dc2626}
+.ops-view{margin-top:.5rem}
+.ops-list{display:flex;flex-direction:column;gap:.7rem}
+.ops-row{background:#fff;border:1px solid #e7e5e4;border-radius:8px;padding:.85rem}
+.ops-row h4{margin:0 0 .35rem 0;font-size:.95rem}
+.ops-meta{font-size:.8rem;color:#555;margin-bottom:.5rem}
+.badge-status{display:inline-block;font-size:.72rem;font-weight:700;padding:.15rem .45rem;border-radius:4px}
+.badge-connected{background:#dcfce7;color:#166534}
+.badge-quarantined,.badge-error{background:#fee2e2;color:#991b1b}
+.routine-form{background:#fff;border:1px solid #ddd;border-radius:8px;padding:1rem;margin-bottom:1rem}
+.routine-form select{display:block;width:100%;padding:.6rem;border-radius:6px;border:1px solid #ccc;background:#fff}
+.main-canvas{max-width:960px}"""
 
 CHAT_SCRIPT = """const el=id=>document.getElementById(id);
 const headers=()=>({'Content-Type':'application/json','Authorization':'Bearer '+el('token').value});
 let activeAgentId='orchestrator';
 let pendingSecretRequestId=null;
+let pendingForgetId=null;
+let pendingForgetText='';
 function append(parent,label,text){
   const box=document.createElement('pre');
   box.textContent=label+'\\n'+text;
@@ -225,6 +385,355 @@ function selectAgent(id,name){
   const cur=el('agent-'+id);
   if(cur)cur.classList.add('active');
   append('replies','System','Switched to agent context: '+(name||id)+' (session: web:local:'+activeAgentId+':'+el('session').value+')');
+  if(el('memory-view')&&el('memory-view').style.display!=='none')loadMemoryCanvas();
+}
+function showView(name){
+  const views={chat:'chat-view',memory:'memory-view',routines:'routines-view',connectors:'connectors-view',teammates:'teammates-view'};
+  const tabs=['chat','memory','routines','connectors','teammates'];
+  for(const key of tabs){
+    const pane=el(views[key]);
+    const tab=el('tab-'+key);
+    const on=key===name;
+    if(pane)pane.style.display=on?'block':'none';
+    if(tab){tab.classList.toggle('active',on);tab.setAttribute('aria-selected',on?'true':'false');}
+  }
+  if(name==='memory')loadMemoryCanvas();
+  if(name==='routines')loadRoutines();
+  if(name==='connectors')loadConnectors();
+  if(name==='teammates')loadTeammates();
+  if(name==='chat')loadUsage();
+}
+function updateUsageMeter(data){
+  if(!data)return;
+  const turn=el('usage-turn');
+  const month=el('usage-month');
+  const fill=el('usage-bar-fill');
+  const total=(data.turnTokens&&data.turnTokens.total)||0;
+  const cost=typeof data.turnCostUsd==='number'?data.turnCostUsd:0;
+  if(turn)turn.textContent='Turn: '+total+' tok · $'+cost.toFixed(4);
+  const spent=typeof data.monthlySpendUsd==='number'?data.monthlySpendUsd:0;
+  const limit=typeof data.monthlyLimitUsd==='number'?data.monthlyLimitUsd:50;
+  if(month)month.textContent='$'+spent.toFixed(2)+' / $'+limit.toFixed(2);
+  const pct=typeof data.budgetPercent==='number'?data.budgetPercent:0;
+  if(fill){
+    fill.style.width=Math.min(100,pct)+'%';
+    fill.classList.remove('level-green','level-yellow','level-red');
+    fill.classList.add('level-'+(data.budgetLevel||'green'));
+  }
+  const meter=el('usage-meter');
+  if(meter){meter.setAttribute('aria-valuenow',String(spent));meter.setAttribute('aria-valuemax',String(limit));}
+}
+async function loadUsage(){
+  if(!el('token')||!el('token').value)return;
+  try{
+    const res=await fetch('/api/usage',{headers:headers()});
+    if(!res.ok)return;
+    updateUsageMeter(await res.json());
+  }catch(err){}
+}
+async function loadRoutines(){
+  const status=el('routines-status');
+  const list=el('routines-list');
+  if(!el('token').value){if(status)status.textContent='Enter access token.';return;}
+  try{
+    const res=await fetch('/api/automation/routines',{headers:headers()});
+    if(!res.ok){if(status)status.textContent='Failed to load routines.';return;}
+    const data=await res.json();
+    if(list)list.replaceChildren();
+    const rows=data.routines||[];
+    if(!rows.length){
+      const empty=document.createElement('div');
+      empty.className='memory-empty';
+      empty.textContent='No routines yet. Create one above.';
+      if(list)list.append(empty);
+    }
+    for(const r of rows){
+      const row=document.createElement('div');
+      row.className='ops-row';
+      const h=document.createElement('h4');
+      h.textContent=r.id||'routine';
+      const meta=document.createElement('div');
+      meta.className='ops-meta';
+      meta.textContent='cron '+ (r.cron||'')+' · next '+(r.nextDueAt||'—')+' · '+((r.grants||[]).join(', ')||'no grants')+' · '+ (r.misfirePolicy||'skip');
+      const prompt=document.createElement('div');
+      prompt.textContent=r.prompt||'';
+      row.append(h,meta,prompt);
+      if(r.source!=='seed'){
+        const del=document.createElement('button');
+        del.type='button';
+        del.className='btn-deny';
+        del.textContent='Delete';
+        del.addEventListener('click',async()=>{
+          await fetch('/api/automation/routines/'+encodeURIComponent(r.id),{method:'DELETE',headers:headers()});
+          loadRoutines();
+        });
+        row.append(del);
+      }
+      if(list)list.append(row);
+    }
+    if(status)status.textContent='Loaded '+rows.length+' routines.';
+  }catch(err){if(status)status.textContent=err.message||'Load failed';}
+}
+async function loadConnectors(){
+  const status=el('connectors-status');
+  const list=el('connectors-list');
+  if(!el('token').value){if(status)status.textContent='Enter access token.';return;}
+  try{
+    const res=await fetch('/api/connectors',{headers:headers()});
+    if(!res.ok){if(status)status.textContent='Failed to load connectors.';return;}
+    const data=await res.json();
+    if(list)list.replaceChildren();
+    const rows=data.connectors||[];
+    if(!rows.length){
+      const empty=document.createElement('div');
+      empty.className='memory-empty';
+      empty.textContent='No MCP connectors configured.';
+      if(list)list.append(empty);
+    }
+    for(const c of rows){
+      const row=document.createElement('div');
+      row.className='ops-row';
+      const h=document.createElement('h4');
+      h.textContent=c.name||c.connectorId;
+      const badge=document.createElement('span');
+      badge.className='badge-status badge-'+(c.status||'error');
+      badge.textContent=c.status||'unknown';
+      h.append(document.createTextNode(' '),badge);
+      const meta=document.createElement('div');
+      meta.className='ops-meta';
+      meta.textContent=(c.protocolVersion||'')+' · '+(c.transport||'')+' · hash '+(c.pinnedHash?c.pinnedHash.slice(0,12)+'…':'unpinned')+(c.quarantineReason?' · '+c.quarantineReason:'');
+      const actions=document.createElement('div');
+      actions.className='memory-actions';
+      const pin=document.createElement('button');
+      pin.type='button';pin.className='btn-approve';pin.textContent='Pin / Approve';
+      pin.addEventListener('click',async()=>{
+        const body={toolsHash:c.pinnedHash||('pending-'+c.connectorId)};
+        await fetch('/api/connectors/'+encodeURIComponent(c.connectorId)+'/pin',{method:'POST',headers:headers(),body:JSON.stringify(body)});
+        loadConnectors();
+      });
+      const q=document.createElement('button');
+      q.type='button';q.className='btn-deny';q.textContent='Quarantine';
+      q.addEventListener('click',async()=>{
+        await fetch('/api/connectors/'+encodeURIComponent(c.connectorId)+'/quarantine',{method:'POST',headers:headers(),body:JSON.stringify({reason:'Operator quarantine from hub'})});
+        loadConnectors();
+      });
+      actions.append(pin,q);
+      row.append(h,meta,actions);
+      if(list)list.append(row);
+    }
+    if(status)status.textContent='Protocol '+(data.protocolVersion||'')+' · '+rows.length+' connectors.';
+  }catch(err){if(status)status.textContent=err.message||'Load failed';}
+}
+async function loadTeammates(){
+  const status=el('teammates-status');
+  const list=el('teammates-tree');
+  if(!el('token').value){if(status)status.textContent='Enter access token.';return;}
+  try{
+    const res=await fetch('/api/teammates',{headers:headers()});
+    if(!res.ok){if(status)status.textContent='Failed to load teammates.';return;}
+    const data=await res.json();
+    if(list)list.replaceChildren();
+    const root=document.createElement('div');
+    root.className='ops-row';
+    const rh=document.createElement('h4');
+    rh.textContent='Coordinator (depth-1 max, concurrency '+(data.maxConcurrentWorkers||3)+')';
+    root.append(rh);
+    if(list)list.append(root);
+    for(const card of (data.cards||[])){
+      const row=document.createElement('div');
+      row.className='ops-row';
+      const h=document.createElement('h4');
+      h.textContent=(card.name||card.id)+' · '+(card.role||'');
+      const meta=document.createElement('div');
+      meta.className='ops-meta';
+      const budget=card.budget||{};
+      meta.textContent=(card.protocolVersion||'a2a/1.0')+' · tools '+((card.capabilities||[]).join(', ')||'none')+' · max $'+(budget.maxCostUsd??budget.max_cost_usd??'—');
+      row.append(h,meta);
+      if(list)list.append(row);
+    }
+    for(const t of (data.active||[])){
+      const row=document.createElement('div');
+      row.className='ops-row';
+      row.textContent='Active: '+t.agentId+' ('+t.status+') depth '+t.depth;
+      if(list)list.append(row);
+    }
+    for(const ev of (data.recentEvents||[]).slice(-8)){
+      const row=document.createElement('div');
+      row.className='ops-row';
+      row.textContent=(ev.eventType||'')+' · '+(ev.subagentId||'')+' · '+(ev.summary||ev.task||ev.status||'');
+      if(list)list.append(row);
+    }
+    if(status)status.textContent='A2A '+(data.protocolVersion||'')+' · '+(data.cards||[]).length+' cards.';
+  }catch(err){if(status)status.textContent=err.message||'Load failed';}
+}
+function trustClass(trust){
+  const t=(trust||'user_explicit').replace(/[^a-z_]/g,'');
+  return 'trust-pill trust-'+t;
+}
+function formatValidity(rec){
+  const from=rec.validFrom||rec.createdAt||'—';
+  const to=rec.validTo||'Present';
+  return 'Valid From: '+from+' → '+to;
+}
+function renderMemoryRow(rec,list){
+  const row=document.createElement('div');
+  row.className='memory-row';
+  row.id='mem-row-'+rec.id;
+  const text=document.createElement('div');
+  text.className='memory-row-text';
+  text.textContent=rec.text||'';
+  const meta=document.createElement('div');
+  meta.className='memory-meta';
+  const evid=document.createElement('span');
+  evid.className='evidence-pill';
+  evid.textContent=rec.id||'';
+  evid.title='Created '+(rec.createdAt||'')+' · rev '+(rec.revision||1);
+  const trust=document.createElement('span');
+  trust.className=trustClass(rec.trust);
+  trust.textContent=rec.trust||'user_explicit';
+  const kind=document.createElement('span');
+  kind.className='evidence-pill';
+  kind.textContent=rec.kind||'fact';
+  const valid=document.createElement('span');
+  valid.className='validity-range';
+  valid.textContent=formatValidity(rec);
+  meta.append(evid,trust,kind,valid);
+  const actions=document.createElement('div');
+  actions.className='memory-actions';
+  const editBtn=document.createElement('button');
+  editBtn.type='button';
+  editBtn.className='btn-edit';
+  editBtn.textContent='Edit';
+  const forgetBtn=document.createElement('button');
+  forgetBtn.type='button';
+  forgetBtn.className='btn-deny';
+  forgetBtn.textContent='Forget';
+  actions.append(editBtn,forgetBtn);
+  const editBox=document.createElement('div');
+  editBox.className='memory-edit-box';
+  const ta=document.createElement('textarea');
+  ta.value=rec.text||'';
+  const saveBtn=document.createElement('button');
+  saveBtn.type='button';
+  saveBtn.className='btn-approve';
+  saveBtn.textContent='Save';
+  const cancelEdit=document.createElement('button');
+  cancelEdit.type='button';
+  cancelEdit.className='btn-edit';
+  cancelEdit.textContent='Cancel';
+  editBox.append(ta,saveBtn,cancelEdit);
+  editBtn.addEventListener('click',()=>{editBox.style.display='block';});
+  cancelEdit.addEventListener('click',()=>{editBox.style.display='none';ta.value=rec.text||'';});
+  saveBtn.addEventListener('click',()=>reviseMemory(rec.id,ta.value,rec.revision,row));
+  forgetBtn.addEventListener('click',()=>openForgetModal(rec.id,rec.text||''));
+  row.append(text,meta,actions,editBox);
+  list.append(row);
+}
+async function loadMemoryCanvas(){
+  const status=el('memory-status');
+  if(!el('token')||!el('token').value){
+    if(status)status.textContent='Enter access token to inspect memory.';
+    return;
+  }
+  const conv=el('session')?el('session').value:'default';
+  const q=new URLSearchParams({agentId:activeAgentId,conversationId:conv,limit:'50'});
+  try{
+    const res=await fetch('/api/memory?'+q.toString(),{headers:headers()});
+    if(!res.ok){
+      if(status)status.textContent='Failed to load memory ('+res.status+').';
+      return;
+    }
+    const data=await res.json();
+    if(el('memory-scope-label'))el('memory-scope-label').textContent='Scope: '+(data.scope||'—');
+    const profileList=el('memory-profile');
+    const journalList=el('memory-journal');
+    if(profileList)profileList.replaceChildren();
+    if(journalList)journalList.replaceChildren();
+    const durable=[...(data.profile||[]),...(data.facts||[])];
+    if(profileList){
+      if(!durable.length){
+        const empty=document.createElement('div');
+        empty.className='memory-empty';
+        empty.textContent='No active profile facts in this scope.';
+        profileList.append(empty);
+      }else{
+        for(const rec of durable)renderMemoryRow(rec,profileList);
+      }
+    }
+    if(journalList){
+      const journal=data.journal||[];
+      if(!journal.length){
+        const empty=document.createElement('div');
+        empty.className='memory-empty';
+        empty.textContent='No episodic journal notes yet.';
+        journalList.append(empty);
+      }else{
+        for(const rec of journal)renderMemoryRow(rec,journalList);
+      }
+    }
+    if(status)status.textContent='Loaded '+(durable.length)+' claims and '+((data.journal||[]).length)+' journal notes.';
+  }catch(err){
+    if(status)status.textContent=err.message||'Memory load failed';
+  }
+}
+function openForgetModal(id,text){
+  pendingForgetId=id;
+  pendingForgetText=text;
+  if(el('forget-record-id'))el('forget-record-id').textContent=id;
+  if(el('forget-record-text'))el('forget-record-text').textContent=text;
+  if(el('forget-modal'))el('forget-modal').style.display='flex';
+}
+function closeForgetModal(){
+  pendingForgetId=null;
+  pendingForgetText='';
+  if(el('forget-modal'))el('forget-modal').style.display='none';
+}
+async function confirmForget(){
+  if(!pendingForgetId)return;
+  const id=pendingForgetId;
+  const conv=el('session')?el('session').value:'default';
+  const status=el('memory-status');
+  try{
+    const res=await fetch('/api/memory/forget',{
+      method:'POST',
+      headers:headers(),
+      body:JSON.stringify({recordId:id,agentId:activeAgentId,conversationId:conv,reason:'web memory canvas forget'})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){
+      if(status)status.textContent=data.detail?.error||data.error||'Forget failed';
+      return;
+    }
+    const row=el('mem-row-'+id);
+    if(row){
+      row.classList.add('vaporize');
+      setTimeout(()=>{row.remove();},360);
+    }
+    if(status)status.textContent=data.message||('Forgotten '+id);
+    closeForgetModal();
+  }catch(err){
+    if(status)status.textContent=err.message||'Forget failed';
+  }
+}
+async function reviseMemory(id,text,expectedRevision,row){
+  const status=el('memory-status');
+  const conv=el('session')?el('session').value:'default';
+  try{
+    const res=await fetch('/api/memory/'+encodeURIComponent(id),{
+      method:'PATCH',
+      headers:headers(),
+      body:JSON.stringify({text:text,agentId:activeAgentId,conversationId:conv,expectedRevision:expectedRevision,reason:'web memory canvas edit'})
+    });
+    const data=await res.json().catch(()=>({}));
+    if(!res.ok){
+      if(status)status.textContent=data.detail?.error||data.error||'Revise failed';
+      return;
+    }
+    if(status)status.textContent='Updated '+(data.record?.id||id)+' (rev '+(data.record?.revision||'?')+').';
+    await loadMemoryCanvas();
+  }catch(err){
+    if(status)status.textContent=err.message||'Revise failed';
+  }
 }
 function updateMilestone(data){
   const list=el('milestones');
@@ -554,10 +1063,16 @@ el('chat').addEventListener('submit',async event=>{
         }else if(evName==='message'){
           if(!assistantBox)assistantBox=append('replies','YusufClaw',data.reply||'');
           else if(assistantBox.textContent==='YusufClaw\\n')assistantBox.textContent='YusufClaw\\n'+(data.reply||'');
+        }else if(evName==='meter.usage'){
+          updateUsageMeter(data.payload||data);
+        }else if(evName==='teammate.spawned'||evName==='teammate.step'||evName==='teammate.finished'){
+          const payload=data.payload||data;
+          append('tools','Teammate',(payload.eventType||evName)+' · '+(payload.subagentId||'')+' · '+(payload.summary||payload.task||payload.status||''));
         }else if(evName==='run.completed'||evName==='done'||evName==='RunFinished'){
           if(data.status==='error'||data.status==='failed')el('status').textContent=data.error||'Run failed';
           else el('status').textContent='Ready';
           el('send').disabled=false;
+          loadUsage();
         }else if(evName==='error'){
           el('status').textContent=data.error||'Request failed';
           el('send').disabled=false;
@@ -581,8 +1096,38 @@ async function poll(){
   }catch(err){}
 }
 setInterval(poll,5000);
-el('token').addEventListener('change',()=>{poll();loadAgents();});
-window.addEventListener('DOMContentLoaded',loadAgents);"""
+el('token').addEventListener('change',()=>{poll();loadAgents();loadUsage();if(el('memory-view')&&el('memory-view').style.display!=='none')loadMemoryCanvas();});
+if(el('tab-chat'))el('tab-chat').addEventListener('click',()=>showView('chat'));
+if(el('tab-memory'))el('tab-memory').addEventListener('click',()=>showView('memory'));
+if(el('tab-routines'))el('tab-routines').addEventListener('click',()=>showView('routines'));
+if(el('tab-connectors'))el('tab-connectors').addEventListener('click',()=>showView('connectors'));
+if(el('tab-teammates'))el('tab-teammates').addEventListener('click',()=>showView('teammates'));
+if(el('memory-refresh'))el('memory-refresh').addEventListener('click',()=>loadMemoryCanvas());
+if(el('routines-refresh'))el('routines-refresh').addEventListener('click',()=>loadRoutines());
+if(el('connectors-refresh'))el('connectors-refresh').addEventListener('click',()=>loadConnectors());
+if(el('teammates-refresh'))el('teammates-refresh').addEventListener('click',()=>loadTeammates());
+if(el('forget-confirm'))el('forget-confirm').addEventListener('click',confirmForget);
+if(el('forget-cancel'))el('forget-cancel').addEventListener('click',closeForgetModal);
+if(el('session'))el('session').addEventListener('change',()=>{if(el('memory-view')&&el('memory-view').style.display!=='none')loadMemoryCanvas();});
+if(el('routine-create'))el('routine-create').addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const grants=(el('routine-grants').value||'').split(',').map(s=>s.trim()).filter(Boolean);
+  const body={
+    id:el('routine-id').value.trim(),
+    cron:el('routine-cron').value.trim(),
+    prompt:el('routine-prompt').value,
+    grants:grants,
+    misfirePolicy:el('routine-misfire').value,
+    target:{channel:'web',userId:'local',conversationId:el('session').value||'default'}
+  };
+  const res=await fetch('/api/automation/routines',{method:'POST',headers:headers(),body:JSON.stringify(body)});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){el('routines-status').textContent=data.detail?.error||data.error||'Create failed';return;}
+  el('routines-status').textContent='Created '+body.id+' · next '+(data.nextDueAt||'—');
+  el('routine-id').value='';el('routine-prompt').value='';
+  loadRoutines();
+});
+window.addEventListener('DOMContentLoaded',()=>{loadAgents();loadUsage();});"""
 
 # Aliases matching TS camelCase exports
 chatPage = CHAT_PAGE

@@ -1011,3 +1011,34 @@ cd infra_py && cdk destroy --all --force --profile yusufclaw
   - `uv run mypy src`: 94 kaynak dosyasında sıfır hata (strict mypy temiz).
 - **Dokümantasyon**: Detaylı kullanım, protokol şemaları ve mimari kararlar `docs/PY-UX-S1.md` dosyasında belgelenmiştir.
 
+
+---
+
+## 29. Python Web Gateway Memory Inspection & Forget Canvas (UX-07) — `cursor/ux-07-memory-canvas-9394` Dalı
+
+- **Kapsam**: `docs/UX-SPEC.md` Sprint 2 kalan maddesi UX-07 — şeffaf bellek denetim kanvası ve deterministik unlearning (UX-05/UX-06 Sprint 1 birleşiminde tamamlanmıştı).
+- **API**:
+  - `GET /api/memory`: Aktif oturum kapsamı `web:{userId}:{agentId}:{conversationId}` için `profile`, `facts`, `journal` listeleri (`memory.canvas`).
+  - `POST /api/memory/forget`: Tombstone + FTS temizliği + aktif retrieval'dan düşürme (`memory.record_deleted`); mükerrer forget HTTP 404.
+  - `PATCH /api/memory/{record_id}`: Yerinde düzenleme, CAS `expectedRevision` (çakışmada HTTP 409, `memory.record_updated`).
+- **Web UI (`web_page.py`)**: Chat / Memory sekmeleri; iki panelli kanvas (profil+olgular / epizodik günlük); evidence/trust/validity rozetleri; Edit + Forget onay modalı; vaporize animasyonu. CSP korunur (`innerHTML` / `localStorage` / `sessionStorage` yok).
+- **Modeller**: `MemoryForgetInput`, `MemoryReviseApiInput`, `MemoryScopeQuery` (`gateway/models.py`).
+- **Korunan sınırlar**: `a2a/`, `writers/`, `sandbox/`, `evals/`, kuyruk motoru, rol YAML'ları ve bellek store iç mantığı değiştirilmedi; store API'leri yeniden kullanıldı.
+- **Doğrulama**: `uv run pytest -q` → **360 passed, 1 skipped, 1 xfailed**; `uv run ruff check .` temiz; `uv run mypy src` → **111 kaynak dosyasında 0 hata**. Testler: `tests/python/test_ux_sprint2_memory.py`. Kılavuz: `docs/PY-UX-S2.md`.
+- §§1–28 korunmuştur.
+
+
+---
+
+## 30. Python Web Gateway Sprint 3 Workspace Readiness Pack (UX-08/11/12/13) — `cursor/ux-07-memory-canvas-9394` Dalı
+
+- **Amaç**: Bitirici paket — workspace'i kullanıma hazır hale getirmek; protokol sürümlerini sabitlemek (`ag-ui/1.0`, `a2a/1.0`, `mcp/2025-03-26`).
+- **UX-08**: `GET/POST/DELETE /api/automation/routines` — cron doğrulama, grants, misfire, `nextDueAt`; Routines sekmesi.
+- **UX-11**: `GET /api/connectors` + pin/quarantine; MCP OAuth alanları (`oauthClientId`, `oauthRedirectUri`); Connectors sekmesi.
+- **UX-12**: `GET /api/teammates` + turn sonunda `teammate.*` SSE; Teammates sekmesi; `AgentCard.protocolVersion`.
+- **UX-13**: `UsageMeter` ($50 tavan, aylık state), `GET /api/usage`, header gauge, `meter.usage` SSE; chat JSON `usage`.
+- **Modül**: `src/yusufclaw/gateway/workspace.py`. Kılavuz: `docs/PY-UX-S3.md`.
+- **Doğrulama**: `uv run pytest -q` → **366 passed, 1 skipped, 1 xfailed**; ruff temiz; mypy **112 dosya / 0 hata**.
+- **Not**: GitHub Actions faturalama kilidi nedeniyle CI runner başlamıyor (kod/test hatası değil). UX-09/10 (artifacts/screencast) sonraki adım.
+- §§1–29 korunmuştur.
+

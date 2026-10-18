@@ -6,6 +6,9 @@ Provides:
 - GET /style.css: Minimal stylesheets
 - GET /health: System health and model provider status probe
 - GET /api/routines: Authenticated web inbox for scheduled replies
+- GET /api/memory: Memory inspection canvas (profile, facts, journal) (UX-07)
+- POST /api/memory/forget: Deterministic unlearning with tombstone (UX-07)
+- PATCH /api/memory/{record_id}: In-place claim edit with CAS (UX-07)
 - POST /api/chat: Authenticated conversational endpoint (JSON or SSE)
 - POST /api/chat/stream: Dedicated AG-UI event stream endpoint (SSE)
 - GET /api/events: SSE real-time gateway event stream
@@ -33,6 +36,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Str
 from pydantic import BaseModel, ConfigDict, Field
 
 from yusufclaw import __version__
+from yusufclaw.a2a.hook import TeammateStatusHook
+from yusufclaw.a2a.registry import TeammateRegistry
 from yusufclaw.agent import reset_turn_event_hook, set_turn_event_hook
 from yusufclaw.config import Settings, get_settings
 from yusufclaw.gateway.approval import (
@@ -47,8 +52,11 @@ from yusufclaw.gateway.credentials import (
     get_credential_broker,
 )
 from yusufclaw.gateway.models import (
+    AG_UI_PROTOCOL_VERSION,
     AgentPersona,
     AgUiEnvelope,
+    MemoryForgetInput,
+    MemoryReviseApiInput,
     MilestoneStep,
     QuestionOption,
     QuestionWidget,
@@ -57,6 +65,18 @@ from yusufclaw.gateway.models import (
     WidgetResolveInput,
 )
 from yusufclaw.gateway.web_page import CHAT_PAGE, CHAT_SCRIPT, CHAT_STYLE
+from yusufclaw.gateway.workspace import (
+    AutomationStore,
+    UsageMeter,
+    serialize_connectors,
+    serialize_teammates,
+    validate_routine_payload,
+)
+from yusufclaw.mcp.models import MCPConfig
+from yusufclaw.mcp.pinning import PinningStore
+from yusufclaw.memory.models import ListOptions, MemoryKind, ReviseInput
+from yusufclaw.memory.store import resolve as resolve_memory
+from yusufclaw.routines.models import Routine
 from yusufclaw.telemetry import setup_telemetry
 
 SENSITIVE_KEY_SUBSTRINGS = {
@@ -255,6 +275,7 @@ def format_agui_event(
     merged = dict(payload)
     merged.update(
         {
+            "protocolVersion": AG_UI_PROTOCOL_VERSION,
             "eventId": evt_id,
             "runId": run_id,
             "sessionId": session_id,
@@ -276,6 +297,12 @@ def create_app(
     settings: Settings | None = None,
     approval_provider: ApprovalProvider | None = None,
     credential_broker: CredentialBroker | None = None,
+    mcp_config: MCPConfig | None = None,
+    pinning_store: PinningStore | None = None,
+    teammate_registry: TeammateRegistry | None = None,
+    teammate_hook: TeammateStatusHook | None = None,
+    routines: list[Routine] | None = None,
+    usage_meter: UsageMeter | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI web gateway application."""
     actual_bus: MessageBus | None
@@ -305,6 +332,12 @@ def create_app(
     active_credential_broker: CredentialBroker = (
         credential_broker if credential_broker is not None else get_credential_broker()
     )
+    active_mcp_config = mcp_config or MCPConfig()
+    active_pinning = pinning_store or PinningStore()
+    active_teammate_registry = teammate_registry
+    active_teammate_hook = teammate_hook or TeammateStatusHook()
+    active_usage = usage_meter or UsageMeter(memory=memory)
+    automation_store = AutomationStore(memory=memory, seed=list(routines or []))
     pending_approvals: dict[str, dict[str, Any]] = {}
     pending_questions: dict[str, dict[str, Any]] = {}
     resolved_questions: dict[str, dict[str, Any]] = {}
@@ -316,6 +349,7 @@ def create_app(
             service_name=cfg.otel_service_name,
             otlp_endpoint=cfg.otel_exporter_otlp_endpoint,
         )
+        await active_usage.load_monthly()
         yield
 
     app = FastAPI(
@@ -744,6 +778,357 @@ def create_app(
         ]
         return JSONResponse(status_code=200, content=creds)
 
+    def _memory_scope(agent_id: str, conversation_id: str) -> str:
+        """Build the composite web session scope matching chat isolation (UX-02/UX-07)."""
+        safe_agent = (agent_id or "orchestrator").strip() or "orchestrator"
+        safe_conv = (conversation_id or "default").strip() or "default"
+        if len(safe_agent) > 64 or len(safe_conv) > 128:
+            raise HTTPException(status_code=400, detail={"error": "Invalid memory scope"})
+        return f"web:{user_id}:{safe_agent}:{safe_conv}"
+
+    def _serialize_memory_record(record: Any) -> dict[str, Any]:
+        """Serialize a MemoryRecord for the inspection canvas without embeddings."""
+        if hasattr(record, "model_dump"):
+            dumped = record.model_dump(by_alias=True, exclude={"embedding"})
+            return dict(dumped) if isinstance(dumped, dict) else {"record": dumped}
+        if isinstance(record, dict):
+            return {str(k): v for k, v in record.items() if k != "embedding"}
+        return {"id": str(getattr(record, "id", "")), "text": str(record)}
+
+    async def _list_memory_kind(
+        scope: str, kind: MemoryKind | None, limit: int
+    ) -> list[dict[str, Any]]:
+        if memory is None or not hasattr(memory, "list"):
+            return []
+        opts = ListOptions(kind=kind, status="active", limit=limit)
+        rows = await resolve_memory(memory.list(scope, opts))
+        return [_serialize_memory_record(r) for r in rows]
+
+    @app.get("/api/memory")
+    async def get_memory_canvas(request: Request) -> JSONResponse:
+        """Split-pane memory inspection payload: profile, facts, and episodic journal (UX-07)."""
+        _verify_auth(request)
+        agent_id = (request.query_params.get("agentId") or "orchestrator").strip()
+        conversation_id = (
+            request.query_params.get("conversationId")
+            or request.query_params.get("session")
+            or "default"
+        ).strip()
+        try:
+            limit = int(request.query_params.get("limit") or "50")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "Invalid limit"}) from exc
+        limit = max(1, min(limit, 200))
+        scope = _memory_scope(agent_id, conversation_id)
+
+        if memory is None:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "scope": scope,
+                    "agentId": agent_id,
+                    "conversationId": conversation_id,
+                    "profile": [],
+                    "facts": [],
+                    "journal": [],
+                    "eventType": "memory.canvas",
+                },
+            )
+
+        profile = await _list_memory_kind(scope, "profile", limit)
+        facts = await _list_memory_kind(scope, "fact", limit)
+        journal = await _list_memory_kind(scope, "note", limit)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "scope": scope,
+                "agentId": agent_id,
+                "conversationId": conversation_id,
+                "profile": profile,
+                "facts": facts,
+                "journal": journal,
+                "eventType": "memory.canvas",
+            },
+        )
+
+    @app.post("/api/memory/forget")
+    async def forget_memory_record(request: Request) -> JSONResponse:
+        """Deterministic unlearning: tombstone, FTS purge, drop from active retrieval (UX-07)."""
+        _verify_auth(request)
+        if memory is None or not hasattr(memory, "forget"):
+            raise HTTPException(status_code=503, detail={"error": "Memory store unavailable"})
+
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+            forget_in = MemoryForgetInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid forget payload"}
+            ) from exc
+
+        scope = _memory_scope(forget_in.agent_id, forget_in.conversation_id)
+        record_id = forget_in.record_id.strip()
+        existing = None
+        if hasattr(memory, "get"):
+            existing = await resolve_memory(
+                memory.get(scope, record_id, include_inactive=True)
+            )
+
+        forgotten = await resolve_memory(
+            memory.forget(scope, record_id, reason=forget_in.reason)
+        )
+        if not forgotten:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "Memory record not found or already deleted"},
+            )
+
+        deleted_at = datetime.now(UTC).isoformat()
+        if existing is not None and getattr(existing, "deleted_at", None):
+            deleted_at = existing.deleted_at or deleted_at
+        elif existing is not None and hasattr(existing, "deletedAt"):
+            deleted_at = existing.deletedAt or deleted_at
+
+        # Re-read after forget for accurate tombstone timestamp when available.
+        if hasattr(memory, "get"):
+            after = await resolve_memory(
+                memory.get(scope, record_id, include_inactive=True)
+            )
+            if after is not None:
+                deleted_at = getattr(after, "deleted_at", None) or getattr(
+                    after, "deletedAt", None
+                ) or deleted_at
+
+        payload = {
+            "recordId": record_id,
+            "scope": scope,
+            "deletedAt": deleted_at,
+            "reason": forget_in.reason,
+            "message": (
+                "Fact deleted from active retrieval, FTS indices, and future context assemblies."
+            ),
+            "eventType": "memory.record_deleted",
+        }
+        return JSONResponse(status_code=200, content=payload)
+
+    @app.patch("/api/memory/{record_id}")
+    async def revise_memory_record(request: Request, record_id: str) -> JSONResponse:
+        """In-place edit of an active claim with optimistic concurrency (UX-07)."""
+        _verify_auth(request)
+        if memory is None or not hasattr(memory, "revise"):
+            raise HTTPException(status_code=503, detail={"error": "Memory store unavailable"})
+
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+            revise_in = MemoryReviseApiInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid revise payload"}
+            ) from exc
+
+        target_id = record_id.strip()
+        if not target_id or len(target_id) > 128:
+            raise HTTPException(status_code=400, detail={"error": "Invalid record id"})
+
+        scope = _memory_scope(revise_in.agent_id, revise_in.conversation_id)
+        previous_revision: int | None = None
+        if hasattr(memory, "get"):
+            before = await resolve_memory(memory.get(scope, target_id))
+            if before is not None:
+                previous_revision = int(getattr(before, "revision", 1))
+
+        try:
+            updated = await resolve_memory(
+                memory.revise(
+                    scope,
+                    target_id,
+                    ReviseInput(
+                        text=revise_in.text.strip(),
+                        category=revise_in.category,
+                        expected_revision=revise_in.expected_revision,
+                        reason=revise_in.reason or "web memory canvas edit",
+                    ),
+                )
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            status = 409 if "Version conflict" in msg else 404
+            raise HTTPException(status_code=status, detail={"error": msg}) from exc
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "record": _serialize_memory_record(updated),
+                "previousRevision": previous_revision,
+                "eventType": "memory.record_updated",
+            },
+        )
+
+    @app.get("/api/automation/routines")
+    async def list_automation_routines(request: Request) -> JSONResponse:
+        """List validated routine definitions with next-due timestamps (UX-08)."""
+        _verify_auth(request)
+        defs = await automation_store.list_definitions()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "protocolVersion": AG_UI_PROTOCOL_VERSION,
+                "routines": defs,
+                "eventType": "routine.catalog",
+            },
+        )
+
+    @app.post("/api/automation/routines")
+    async def create_automation_routine(request: Request) -> JSONResponse:
+        """Create a routine with strict grants and verified next-due (UX-08)."""
+        _verify_auth(request)
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        try:
+            raw = json.loads((await request.body()).decode("utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("object required")
+            payload = validate_routine_payload(raw)
+            created = await automation_store.create(**payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid routine payload"}
+            ) from exc
+        return JSONResponse(status_code=201, content=created)
+
+    @app.delete("/api/automation/routines/{routine_id}")
+    async def delete_automation_routine(
+        request: Request, routine_id: str
+    ) -> JSONResponse:
+        """Delete a user-authored routine definition (UX-08)."""
+        _verify_auth(request)
+        removed = await automation_store.delete(routine_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail={"error": "Routine not found"})
+        return JSONResponse(
+            status_code=200,
+            content={"id": routine_id, "deleted": True, "eventType": "routine.deleted"},
+        )
+
+    @app.get("/api/connectors")
+    async def list_connectors(request: Request) -> JSONResponse:
+        """MCP connector hub status with pin/quarantine metadata (UX-11)."""
+        _verify_auth(request)
+        rows = serialize_connectors(active_mcp_config, active_pinning)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "protocolVersion": "mcp/2025-03-26",
+                "connectors": rows,
+                "eventType": "connector.catalog",
+            },
+        )
+
+    @app.post("/api/connectors/{connector_id}/pin")
+    async def pin_connector(request: Request, connector_id: str) -> JSONResponse:
+        """Approve current tool hash and clear quarantine (UX-11)."""
+        _verify_auth(request)
+        name = connector_id.strip()
+        server = active_mcp_config.servers.get(name)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "Unknown connector"})
+        body: dict[str, Any] = {}
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                raw = json.loads((await request.body()).decode("utf-8") or "{}")
+                if isinstance(raw, dict):
+                    body = raw
+            except Exception:
+                body = {}
+        tools_hash = str(
+            body.get("toolsHash") or body.get("pinnedHash") or server.pinned_hash or ""
+        ).strip()
+        if not tools_hash:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "toolsHash required to pin connector"},
+            )
+        rec = active_pinning.pin_server(
+            name, tools_hash=tools_hash, version=server.version
+        )
+        server.quarantined = False
+        server.pinned_hash = tools_hash
+        return JSONResponse(
+            status_code=200,
+            content={
+                "connectorId": name,
+                "status": "connected",
+                "pinnedHash": rec.tools_hash,
+                "protocolVersion": server.protocol_version,
+                "eventType": "connector.status_changed",
+            },
+        )
+
+    @app.post("/api/connectors/{connector_id}/quarantine")
+    async def quarantine_connector(request: Request, connector_id: str) -> JSONResponse:
+        """Force-quarantine a connector until re-pin (UX-11)."""
+        _verify_auth(request)
+        name = connector_id.strip()
+        server = active_mcp_config.servers.get(name)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "Unknown connector"})
+        reason = "Operator quarantine"
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                raw = json.loads((await request.body()).decode("utf-8") or "{}")
+                if isinstance(raw, dict) and raw.get("reason"):
+                    reason = str(raw["reason"])[:512]
+            except Exception:
+                pass
+        rec = active_pinning.quarantine_server(
+            name,
+            reason=reason,
+            tools_hash=server.pinned_hash or "",
+            version=server.version,
+        )
+        server.quarantined = True
+        return JSONResponse(
+            status_code=200,
+            content={
+                "connectorId": name,
+                "status": "quarantined",
+                "quarantineReason": rec.quarantine_reason,
+                "pinnedHash": rec.tools_hash,
+                "eventType": "connector.status_changed",
+            },
+        )
+
+    @app.get("/api/teammates")
+    async def list_teammates(request: Request) -> JSONResponse:
+        """A2A teammate hierarchy visualizer snapshot (UX-12)."""
+        _verify_auth(request)
+        return JSONResponse(
+            status_code=200,
+            content=serialize_teammates(active_teammate_registry, active_teammate_hook),
+        )
+
+    @app.get("/api/usage")
+    async def get_usage_meter(request: Request) -> JSONResponse:
+        """Token/cost meter against the $50 monthly ceiling (UX-13)."""
+        _verify_auth(request)
+        await active_usage.load_monthly()
+        return JSONResponse(status_code=200, content=active_usage.snapshot())
+
     @app.post("/api/chat")
     async def chat(
         request: Request, accept: str | None = Header(default=None)
@@ -769,12 +1154,15 @@ def create_app(
                     pending_questions=pending_questions,
                     pending_secrets=pending_secrets,
                     credential_broker=active_credential_broker,
+                    usage_meter=active_usage,
+                    teammate_hook=active_teammate_hook,
                 ),
                 media_type="text/event-stream",
             )
 
         # Standard synchronous turn
         try:
+            active_usage.begin_turn()
             reply = await actual_bus.dispatch(
                 IncomingMessage(
                     channel="web",
@@ -785,7 +1173,13 @@ def create_app(
                     agentId=msg_in.agentId,
                 )
             )
-            return JSONResponse(status_code=200, content={"reply": reply})
+            approx_prompt = max(1, len(msg_in.text) // 4)
+            approx_completion = max(1, len(reply or "") // 4)
+            await active_usage.record_tokens(approx_prompt, approx_completion)
+            return JSONResponse(
+                status_code=200,
+                content={"reply": reply, "usage": active_usage.snapshot()},
+            )
         except Exception:
             # Mask internal exceptions and URLs
             return JSONResponse(
@@ -818,6 +1212,8 @@ def create_app(
                 pending_questions=pending_questions,
                 pending_secrets=pending_secrets,
                 credential_broker=active_credential_broker,
+                usage_meter=active_usage,
+                teammate_hook=active_teammate_hook,
             ),
             media_type="text/event-stream",
         )
@@ -863,6 +1259,8 @@ async def _stream_chat_events(
     pending_questions: dict[str, dict[str, Any]] | None = None,
     pending_secrets: dict[str, asyncio.Future[dict[str, Any]]] | None = None,
     credential_broker: CredentialBroker | None = None,
+    usage_meter: UsageMeter | None = None,
+    teammate_hook: TeammateStatusHook | None = None,
 ) -> AsyncIterator[str]:
     """Emit AG-UI 1.0 Server-Sent Events (run.acknowledged, run.milestone, message.delta, widgets, run.completed)."""
     run_id = f"run-{uuid.uuid4()}"
@@ -876,6 +1274,11 @@ async def _stream_chat_events(
     start_time = datetime.now(UTC)
     accumulated_text = ""
     current_step = 1
+    meter = usage_meter or UsageMeter()
+    meter.begin_turn()
+    hook_seen = 0
+    if teammate_hook is not None:
+        hook_seen = len(teammate_hook.history)
 
     def agui_ev(event_type: str, payload: dict[str, Any]) -> str:
         nonlocal sequence
@@ -1307,6 +1710,20 @@ async def _stream_chat_events(
                     },
                 )
             )
+            # UX-12: flush teammate hierarchy events observed during the turn
+            if teammate_hook is not None:
+                for ev in teammate_hook.history[hook_seen:]:
+                    await event_queue.put(
+                        agui_ev(
+                            ev.event_type,
+                            ev.model_dump(by_alias=True, mode="json"),
+                        )
+                    )
+            # UX-13: usage meter against $50 monthly ceiling
+            approx_prompt = max(1, len(msg_in.text) // 4)
+            approx_completion = max(1, len(reply or accumulated_text) // 4)
+            await meter.record_tokens(approx_prompt, approx_completion)
+            await event_queue.put(agui_ev("meter.usage", meter.snapshot()))
             # Legacy done event for backward compatibility
             await event_queue.put(
                 format_sse_event(
