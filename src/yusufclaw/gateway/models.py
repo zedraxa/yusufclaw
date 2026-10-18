@@ -173,9 +173,84 @@ class AgentPersona(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list, alias="allowedTools")
 
 
+class MemoryScopeQuery(BaseModel):
+    """Query parameters locating a web session memory scope (UX-07)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    agent_id: str = Field(default="orchestrator", min_length=1, max_length=64, alias="agentId")
+    conversation_id: str = Field(
+        default="default", min_length=1, max_length=128, alias="conversationId"
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+    @property
+    def agentId(self) -> str:
+        return self.agent_id
+
+    @property
+    def conversationId(self) -> str:
+        return self.conversation_id
+
+
+class MemoryForgetInput(BaseModel):
+    """Confirm deterministic unlearning of a durable memory record (UX-07)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    record_id: str = Field(min_length=1, max_length=128, alias="recordId")
+    agent_id: str = Field(default="orchestrator", min_length=1, max_length=64, alias="agentId")
+    conversation_id: str = Field(
+        default="default", min_length=1, max_length=128, alias="conversationId"
+    )
+    reason: str | None = Field(default=None, max_length=512)
+
+    @property
+    def recordId(self) -> str:
+        return self.record_id
+
+    @property
+    def agentId(self) -> str:
+        return self.agent_id
+
+    @property
+    def conversationId(self) -> str:
+        return self.conversation_id
+
+
+class MemoryReviseApiInput(BaseModel):
+    """In-place edit of an active memory claim with CAS revision guard (UX-07)."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    text: str = Field(min_length=1, max_length=8000)
+    agent_id: str = Field(default="orchestrator", min_length=1, max_length=64, alias="agentId")
+    conversation_id: str = Field(
+        default="default", min_length=1, max_length=128, alias="conversationId"
+    )
+    expected_revision: int | None = Field(default=None, ge=1, alias="expectedRevision")
+    category: str | None = Field(default=None, max_length=128)
+    reason: str | None = Field(default=None, max_length=512)
+
+    @property
+    def agentId(self) -> str:
+        return self.agent_id
+
+    @property
+    def conversationId(self) -> str:
+        return self.conversation_id
+
+    @property
+    def expectedRevision(self) -> int | None:
+        return self.expected_revision
+
+
 __all__ = [
     "AgUiEnvelope",
     "AgentPersona",
+    "MemoryForgetInput",
+    "MemoryReviseApiInput",
+    "MemoryScopeQuery",
     "MilestoneStep",
     "QuestionOption",
     "QuestionWidget",

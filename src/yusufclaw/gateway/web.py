@@ -6,6 +6,9 @@ Provides:
 - GET /style.css: Minimal stylesheets
 - GET /health: System health and model provider status probe
 - GET /api/routines: Authenticated web inbox for scheduled replies
+- GET /api/memory: Memory inspection canvas (profile, facts, journal) (UX-07)
+- POST /api/memory/forget: Deterministic unlearning with tombstone (UX-07)
+- PATCH /api/memory/{record_id}: In-place claim edit with CAS (UX-07)
 - POST /api/chat: Authenticated conversational endpoint (JSON or SSE)
 - POST /api/chat/stream: Dedicated AG-UI event stream endpoint (SSE)
 - GET /api/events: SSE real-time gateway event stream
@@ -49,6 +52,8 @@ from yusufclaw.gateway.credentials import (
 from yusufclaw.gateway.models import (
     AgentPersona,
     AgUiEnvelope,
+    MemoryForgetInput,
+    MemoryReviseApiInput,
     MilestoneStep,
     QuestionOption,
     QuestionWidget,
@@ -57,6 +62,8 @@ from yusufclaw.gateway.models import (
     WidgetResolveInput,
 )
 from yusufclaw.gateway.web_page import CHAT_PAGE, CHAT_SCRIPT, CHAT_STYLE
+from yusufclaw.memory.models import ListOptions, MemoryKind, ReviseInput
+from yusufclaw.memory.store import resolve as resolve_memory
 from yusufclaw.telemetry import setup_telemetry
 
 SENSITIVE_KEY_SUBSTRINGS = {
@@ -743,6 +750,204 @@ def create_app(
             for s in active_credential_broker.list_secrets()
         ]
         return JSONResponse(status_code=200, content=creds)
+
+    def _memory_scope(agent_id: str, conversation_id: str) -> str:
+        """Build the composite web session scope matching chat isolation (UX-02/UX-07)."""
+        safe_agent = (agent_id or "orchestrator").strip() or "orchestrator"
+        safe_conv = (conversation_id or "default").strip() or "default"
+        if len(safe_agent) > 64 or len(safe_conv) > 128:
+            raise HTTPException(status_code=400, detail={"error": "Invalid memory scope"})
+        return f"web:{user_id}:{safe_agent}:{safe_conv}"
+
+    def _serialize_memory_record(record: Any) -> dict[str, Any]:
+        """Serialize a MemoryRecord for the inspection canvas without embeddings."""
+        if hasattr(record, "model_dump"):
+            dumped = record.model_dump(by_alias=True, exclude={"embedding"})
+            return dict(dumped) if isinstance(dumped, dict) else {"record": dumped}
+        if isinstance(record, dict):
+            return {str(k): v for k, v in record.items() if k != "embedding"}
+        return {"id": str(getattr(record, "id", "")), "text": str(record)}
+
+    async def _list_memory_kind(
+        scope: str, kind: MemoryKind | None, limit: int
+    ) -> list[dict[str, Any]]:
+        if memory is None or not hasattr(memory, "list"):
+            return []
+        opts = ListOptions(kind=kind, status="active", limit=limit)
+        rows = await resolve_memory(memory.list(scope, opts))
+        return [_serialize_memory_record(r) for r in rows]
+
+    @app.get("/api/memory")
+    async def get_memory_canvas(request: Request) -> JSONResponse:
+        """Split-pane memory inspection payload: profile, facts, and episodic journal (UX-07)."""
+        _verify_auth(request)
+        agent_id = (request.query_params.get("agentId") or "orchestrator").strip()
+        conversation_id = (
+            request.query_params.get("conversationId")
+            or request.query_params.get("session")
+            or "default"
+        ).strip()
+        try:
+            limit = int(request.query_params.get("limit") or "50")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "Invalid limit"}) from exc
+        limit = max(1, min(limit, 200))
+        scope = _memory_scope(agent_id, conversation_id)
+
+        if memory is None:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "scope": scope,
+                    "agentId": agent_id,
+                    "conversationId": conversation_id,
+                    "profile": [],
+                    "facts": [],
+                    "journal": [],
+                    "eventType": "memory.canvas",
+                },
+            )
+
+        profile = await _list_memory_kind(scope, "profile", limit)
+        facts = await _list_memory_kind(scope, "fact", limit)
+        journal = await _list_memory_kind(scope, "note", limit)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "scope": scope,
+                "agentId": agent_id,
+                "conversationId": conversation_id,
+                "profile": profile,
+                "facts": facts,
+                "journal": journal,
+                "eventType": "memory.canvas",
+            },
+        )
+
+    @app.post("/api/memory/forget")
+    async def forget_memory_record(request: Request) -> JSONResponse:
+        """Deterministic unlearning: tombstone, FTS purge, drop from active retrieval (UX-07)."""
+        _verify_auth(request)
+        if memory is None or not hasattr(memory, "forget"):
+            raise HTTPException(status_code=503, detail={"error": "Memory store unavailable"})
+
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+            forget_in = MemoryForgetInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid forget payload"}
+            ) from exc
+
+        scope = _memory_scope(forget_in.agent_id, forget_in.conversation_id)
+        record_id = forget_in.record_id.strip()
+        existing = None
+        if hasattr(memory, "get"):
+            existing = await resolve_memory(
+                memory.get(scope, record_id, include_inactive=True)
+            )
+
+        forgotten = await resolve_memory(
+            memory.forget(scope, record_id, reason=forget_in.reason)
+        )
+        if not forgotten:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "Memory record not found or already deleted"},
+            )
+
+        deleted_at = datetime.now(UTC).isoformat()
+        if existing is not None and getattr(existing, "deleted_at", None):
+            deleted_at = existing.deleted_at or deleted_at
+        elif existing is not None and hasattr(existing, "deletedAt"):
+            deleted_at = existing.deletedAt or deleted_at
+
+        # Re-read after forget for accurate tombstone timestamp when available.
+        if hasattr(memory, "get"):
+            after = await resolve_memory(
+                memory.get(scope, record_id, include_inactive=True)
+            )
+            if after is not None:
+                deleted_at = getattr(after, "deleted_at", None) or getattr(
+                    after, "deletedAt", None
+                ) or deleted_at
+
+        payload = {
+            "recordId": record_id,
+            "scope": scope,
+            "deletedAt": deleted_at,
+            "reason": forget_in.reason,
+            "message": (
+                "Fact deleted from active retrieval, FTS indices, and future context assemblies."
+            ),
+            "eventType": "memory.record_deleted",
+        }
+        return JSONResponse(status_code=200, content=payload)
+
+    @app.patch("/api/memory/{record_id}")
+    async def revise_memory_record(request: Request, record_id: str) -> JSONResponse:
+        """In-place edit of an active claim with optimistic concurrency (UX-07)."""
+        _verify_auth(request)
+        if memory is None or not hasattr(memory, "revise"):
+            raise HTTPException(status_code=503, detail={"error": "Memory store unavailable"})
+
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
+        if content_type != "application/json":
+            raise HTTPException(status_code=415, detail={"error": "JSON required"})
+        body = await request.body()
+        if len(body) > 100_000:
+            raise HTTPException(status_code=413, detail={"error": "Request too large"})
+        try:
+            raw_data = json.loads(body.decode("utf-8"))
+            revise_in = MemoryReviseApiInput.model_validate(raw_data)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail={"error": "Invalid revise payload"}
+            ) from exc
+
+        target_id = record_id.strip()
+        if not target_id or len(target_id) > 128:
+            raise HTTPException(status_code=400, detail={"error": "Invalid record id"})
+
+        scope = _memory_scope(revise_in.agent_id, revise_in.conversation_id)
+        previous_revision: int | None = None
+        if hasattr(memory, "get"):
+            before = await resolve_memory(memory.get(scope, target_id))
+            if before is not None:
+                previous_revision = int(getattr(before, "revision", 1))
+
+        try:
+            updated = await resolve_memory(
+                memory.revise(
+                    scope,
+                    target_id,
+                    ReviseInput(
+                        text=revise_in.text.strip(),
+                        category=revise_in.category,
+                        expected_revision=revise_in.expected_revision,
+                        reason=revise_in.reason or "web memory canvas edit",
+                    ),
+                )
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            status = 409 if "Version conflict" in msg else 404
+            raise HTTPException(status_code=status, detail={"error": msg}) from exc
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "record": _serialize_memory_record(updated),
+                "previousRevision": previous_revision,
+                "eventType": "memory.record_updated",
+            },
+        )
 
     @app.post("/api/chat")
     async def chat(

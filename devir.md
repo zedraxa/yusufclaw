@@ -1011,3 +1011,19 @@ cd infra_py && cdk destroy --all --force --profile yusufclaw
   - `uv run mypy src`: 94 kaynak dosyasında sıfır hata (strict mypy temiz).
 - **Dokümantasyon**: Detaylı kullanım, protokol şemaları ve mimari kararlar `docs/PY-UX-S1.md` dosyasında belgelenmiştir.
 
+
+---
+
+## 29. Python Web Gateway Memory Inspection & Forget Canvas (UX-07) — `cursor/ux-07-memory-canvas-9394` Dalı
+
+- **Kapsam**: `docs/UX-SPEC.md` Sprint 2 kalan maddesi UX-07 — şeffaf bellek denetim kanvası ve deterministik unlearning (UX-05/UX-06 Sprint 1 birleşiminde tamamlanmıştı).
+- **API**:
+  - `GET /api/memory`: Aktif oturum kapsamı `web:{userId}:{agentId}:{conversationId}` için `profile`, `facts`, `journal` listeleri (`memory.canvas`).
+  - `POST /api/memory/forget`: Tombstone + FTS temizliği + aktif retrieval'dan düşürme (`memory.record_deleted`); mükerrer forget HTTP 404.
+  - `PATCH /api/memory/{record_id}`: Yerinde düzenleme, CAS `expectedRevision` (çakışmada HTTP 409, `memory.record_updated`).
+- **Web UI (`web_page.py`)**: Chat / Memory sekmeleri; iki panelli kanvas (profil+olgular / epizodik günlük); evidence/trust/validity rozetleri; Edit + Forget onay modalı; vaporize animasyonu. CSP korunur (`innerHTML` / `localStorage` / `sessionStorage` yok).
+- **Modeller**: `MemoryForgetInput`, `MemoryReviseApiInput`, `MemoryScopeQuery` (`gateway/models.py`).
+- **Korunan sınırlar**: `a2a/`, `writers/`, `sandbox/`, `evals/`, kuyruk motoru, rol YAML'ları ve bellek store iç mantığı değiştirilmedi; store API'leri yeniden kullanıldı.
+- **Doğrulama**: `uv run pytest -q` → **360 passed, 1 skipped, 1 xfailed**; `uv run ruff check .` temiz; `uv run mypy src` → **111 kaynak dosyasında 0 hata**. Testler: `tests/python/test_ux_sprint2_memory.py`. Kılavuz: `docs/PY-UX-S2.md`.
+- §§1–28 korunmuştur.
+
